@@ -64,7 +64,7 @@ def _split_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
     assert dim_size % world_size == 0
     local_dim_size = dim_size // world_size
     dim_offset = get_tensor_model_parallel_rank() * local_dim_size
-    output = input_[dim_offset:dim_offset + local_dim_size].contiguous()
+    output = input_[dim_offset : dim_offset + local_dim_size].contiguous()
     return output
 
 
@@ -82,9 +82,7 @@ def _gather_along_last_dim(input_: torch.Tensor) -> torch.Tensor:
 
     tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
     tensor_list[rank] = input_
-    torch.distributed.all_gather(
-        tensor_list, input_, group=get_tensor_model_parallel_group()
-    )
+    torch.distributed.all_gather(tensor_list, input_, group=get_tensor_model_parallel_group())
 
     # Note: torch.cat already creates a contiguous tensor.
     output = torch.cat(tensor_list, dim=last_dim).contiguous()
@@ -103,15 +101,7 @@ def _gather_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
     shape[0] *= world_size
 
     output = torch.empty(shape, dtype=input_.dtype, device=torch.cuda.current_device())
-    # Original implementation uses `_all_gather_base` as follows.
-    # Deliberately keep the comment-out for reference because
-    # I'd love to switch to this API once this gets public/stable.
-    # torch.distributed._all_gather_base(output, input_.contiguous(), group=get_tensor_model_parallel_group())
-    torch.distributed.all_gather(
-        list(output.chunk(world_size)),
-        input_.contiguous(),
-        group=get_tensor_model_parallel_group(),
-    )
+    torch.distributed._all_gather_base(output, input_.contiguous(), group=get_tensor_model_parallel_group())
     return output
 
 
@@ -131,9 +121,7 @@ def _reduce_scatter_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
     # I'd love to switch to this API once this gets public/stable.
     # torch.distributed._reduce_scatter_base(output, input_.contiguous(), group=get_tensor_model_parallel_group())
     torch.distributed.reduce_scatter(
-        output,
-        list(input_.contiguous().chunk(world_size)),
-        group=get_tensor_model_parallel_group(),
+        output, list(input_.contiguous().chunk(world_size)), group=get_tensor_model_parallel_group(),
     )
     return output
 
