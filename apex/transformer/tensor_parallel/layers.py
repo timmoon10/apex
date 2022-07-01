@@ -317,11 +317,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             sub_grad_input = torch.empty(
                 input.shape, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
             )
-            handle = torch.distributed.reduce_scatter(
-                sub_grad_input,
-                list(grad_input.chunk(get_tensor_model_parallel_world_size())),
-                group=get_tensor_model_parallel_group(),
-                async_op=True,
+            # reduce_scatter
+            handle = torch.distributed._reduce_scatter_base(
+                sub_grad_input, grad_input, group=get_tensor_model_parallel_group(), async_op=True
             )
             # Delay the start of weight gradient computation shortly (3us) to have reduce scatter scheduled first and have GPU resources allocated
             _ = torch.empty(1, device=grad_output.device) + 1
