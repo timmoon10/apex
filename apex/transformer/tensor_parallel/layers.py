@@ -292,8 +292,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True,
             )
 
-            # Delay the start of input gradient computation shortly (3us) to have gather scheduled first and have GPU resources allocated
-            _ = torch.empty(1, device=grad_output.device) + 1
             total_input = all_gather_buffer
         else:
             total_input = input
@@ -308,9 +306,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.async_grad_allreduce:
             # Asynchronous all-reduce
             handle = torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group(), async_op=True)
-            # Delay the start of weight gradient computation shortly (3us) to have
-            # all-reduce scheduled first and have GPU resources allocated
-            _ = torch.empty(1, device=grad_output.device) + 1
 
         if ctx.sequence_parallel_enabled:
             assert not ctx.async_grad_allreduce
@@ -321,8 +316,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             handle = torch.distributed._reduce_scatter_base(
                 sub_grad_input, grad_input, group=get_tensor_model_parallel_group(), async_op=True
             )
-            # Delay the start of weight gradient computation shortly (3us) to have reduce scatter scheduled first and have GPU resources allocated
-            _ = torch.empty(1, device=grad_output.device) + 1
 
         if ctx.gradient_accumulation_fusion:
             if not ctx.use_16bit_in_wgrad_accum_fusion:
