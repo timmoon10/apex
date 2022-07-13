@@ -33,17 +33,6 @@ def get_tensor_shapes(
     decoder_sequence_length: Optional[int] = None,
     sequence_parallel_enabled: bool = False,
 ) -> Sequence[Sequence[int]]:
-    """Get tensors shapes
-
-    Args:
-        rank: pipeline parallel rank
-        model_type:
-
-    Keyword Args:
-        tensor_shape:
-        decoder_sequence_length:
-        sequence_parallel_enabled:
-    """
     # Determine right tensor sizes (based on position of rank with respect to split
     # rank) and model size.
     # Send two tensors if model is T5 and rank is in decoder stage:
@@ -55,28 +44,33 @@ def get_tensor_shapes(
     assert (
         len(tensor_shape) == 3
     ), f"`tensor_shape` should be [sequence_length, micro_batch_size, hidden_size] but {tensor_shape}"
+
     sequence_length, micro_batch_size, hidden_size = tensor_shape
-    seq_len = sequence_length
-    if sequence_parallel_enabled:
-        seq_len = sequence_length // parallel_state.get_tensor_model_parallel_world_size()
+
     tensor_shapes = []
-    if model_type == ModelType.encoder_and_decoder:
-        if decoder_sequence_length is None:
-            raise ValueError("`decoder_sequence_length` is required for `ModelType.encoder_and_decoder`")
-        dec_seq_len = decoder_sequence_length
-        if sequence_parallel_enabled:
-            dec_seq_len = decoder_sequence_length // parallel_state.get_tensor_model_parallel_world_size()
-        if parallel_state.is_pipeline_stage_before_split(rank):
-            # If next rank is after split, then need transpose for encoder_hidden_state.
-            if parallel_state.is_pipeline_stage_before_split(rank + 1):
-                tensor_shapes.append((seq_len, micro_batch_size, hidden_size))
-            else:
-                tensor_shapes.append((dec_seq_len, micro_batch_size, hidden_size))
-        else:
-            tensor_shapes.append((dec_seq_len, micro_batch_size, hidden_size))
-            tensor_shapes.append((seq_len, micro_batch_size, hidden_size))
+
+    if sequence_parallel_enabled:
+        seq_length = sequence_length // parallel_state.get_tensor_model_parallel_world_size()
     else:
-        tensor_shapes.append((seq_len, micro_batch_size, hidden_size))
+        seq_length = sequence_length
+
+    seq_length = sequence_length
+
+    if model_type == ModelType.encoder_and_decoder:
+
+        if sequence_parallel_enabled:
+            dec_seq_length = decoder_sequence_length // parallel_state.get_tensor_model_parallel_world_size()
+        else:
+            dec_seq_length = decoder_sequence_length
+
+        if parallel_state.is_pipeline_stage_before_split(rank):
+            tensor_shapes.append((seq_length, micro_batch_size, hidden_size))
+        else:
+            tensor_shapes.append((dec_seq_length, micro_batch_size, hidden_size))
+            tensor_shapes.append((seq_length, micro_batch_size, hidden_size))
+    else:
+        tensor_shapes.append((seq_length, micro_batch_size, hidden_size))
+
     return tensor_shapes
 
 
@@ -274,8 +268,7 @@ def forward_backward_pipelining_without_interleaving(
 
     if deallocate_pipeline_outputs:
         warnings.warn(
-            "`deallocate_pipeline_outputs` is experimental and subject to change. "
-            "This option is not recommended."
+            "`deallocate_pipeline_outputs` is experimental and subject to change. " "This option is not recommended."
         )
 
     model: List[torch.nn.Module] = listify_model(model)
@@ -334,13 +327,7 @@ def forward_backward_pipelining_without_interleaving(
         )
         cur_microbatch: Optional[torch.Tensor] = get_kth_microbatch(batch, i)
         output_tensor = forward_step(
-            forward_step_func,
-            cur_microbatch,
-            model,
-            input_tensor,
-            losses_reduced,
-            dtype,
-            disable_autocast,
+            forward_step_func, cur_microbatch, model, input_tensor, losses_reduced, dtype, disable_autocast,
         )
         _logger.debug("send fwd")
         send_forward(
@@ -361,7 +348,9 @@ def forward_backward_pipelining_without_interleaving(
     # receive this tensor here.
     if num_microbatches_remaining > 0:
         _logger.debug("recv_forward before steady state start")
-        input_tensor: List[Union[None, torch.Tensor, FutureTensor]] = recv_forward(tensor_shapes=recv_tensor_shapes, dtype=dtype, async_comm=async_comm)
+        input_tensor: List[Union[None, torch.Tensor, FutureTensor]] = recv_forward(
+            tensor_shapes=recv_tensor_shapes, dtype=dtype, async_comm=async_comm
+        )
 
     ###################################################################################################################
     # Run 1F1B in steady state.
@@ -373,13 +362,7 @@ def forward_backward_pipelining_without_interleaving(
 
         cur_microbatch: Optional[torch.Tensor] = get_kth_microbatch(batch, i + num_warmup_microbatches)
         output_tensor: Union[torch.Tensor, Sequence[torch.Tensor]] = forward_step(
-            forward_step_func,
-            cur_microbatch,
-            model,
-            input_tensor,
-            losses_reduced,
-            dtype,
-            disable_autocast,
+            forward_step_func, cur_microbatch, model, input_tensor, losses_reduced, dtype, disable_autocast,
         )
         if forward_only:
             _logger.debug("send fwd")
