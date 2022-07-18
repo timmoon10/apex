@@ -54,8 +54,6 @@ def get_tensor_shapes(
     else:
         seq_length = sequence_length
 
-    seq_length = sequence_length
-
     if model_type == ModelType.encoder_and_decoder:
 
         if sequence_parallel_enabled:
