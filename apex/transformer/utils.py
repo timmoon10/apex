@@ -31,7 +31,14 @@ def gather_split_1d_tensor(tensor):
     numel = torch.numel(tensor)
     numel_gathered = world_size * numel
     gathered = torch.empty(
-        numel_gathered, dtype=tensor.dtype, device=torch.cuda.current_device(), requires_grad=False,
+        numel_gathered,
+        dtype=tensor.dtype,
+        device=torch.cuda.current_device(),
+        requires_grad=False,
     )
-    torch.distributed._all_gather_base(gathered, tensor, group=parallel_state.get_tensor_model_parallel_group())
+    torch.distributed._all_gather_base(
+        gathered,
+        tensor,
+        group=parallel_state.get_tensor_model_parallel_group()
+        )
     return gathered

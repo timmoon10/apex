@@ -101,7 +101,11 @@ def _gather_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
     shape[0] *= world_size
 
     output = torch.empty(shape, dtype=input_.dtype, device=torch.cuda.current_device())
-    torch.distributed._all_gather_base(output, input_.contiguous(), group=get_tensor_model_parallel_group())
+    torch.distributed._all_gather_base(
+        output,
+        input_.contiguous(),
+        group=get_tensor_model_parallel_group()
+        )
     return output
 
 
@@ -116,7 +120,11 @@ def _reduce_scatter_along_first_dim(input_: torch.Tensor) -> torch.Tensor:
     assert shape[0] % world_size == 0
     shape[0] //= world_size
     output = torch.empty(shape, dtype=input_.dtype, device=torch.cuda.current_device())
-    torch.distributed._reduce_scatter_base(output, input_.contiguous(), group=get_tensor_model_parallel_group())
+    torch.distributed._reduce_scatter_base(
+        output,
+        input_.contiguous(),
+        group=get_tensor_model_parallel_group()
+        )
     return output
 
 

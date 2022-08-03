@@ -105,20 +105,6 @@ cmdclass = {}
 ext_modules = []
 
 extras = {}
-if "--pyprof" in sys.argv:
-    string = (
-        "\n\nPyprof has been moved to its own dedicated repository and will "
-        "soon be removed from Apex.  Please visit\n"
-        "https://github.com/NVIDIA/PyProf\n"
-        "for the latest version."
-    )
-    warnings.warn(string, DeprecationWarning)
-    with open("requirements.txt") as f:
-        required_packages = f.read().splitlines()
-        extras["pyprof"] = required_packages
-    sys.argv.remove("--pyprof")
-else:
-    warnings.warn("Option --pyprof not specified. Not installing PyProf dependencies!")
 
 if "--cpp_ext" in sys.argv or "--cuda_ext" in sys.argv:
     if TORCH_MAJOR == 0:
@@ -413,6 +399,24 @@ if "--focal_loss" in sys.argv:
             sources=[
                 'apex/contrib/csrc/focal_loss/focal_loss_cuda.cpp',
                 'apex/contrib/csrc/focal_loss/focal_loss_cuda_kernel.cu',
+            ],
+            include_dirs=[os.path.join(this_dir, 'csrc')],
+            extra_compile_args={
+                'cxx': ['-O3'] + version_dependent_macros,
+                'nvcc':['-O3', '--use_fast_math', '--ftz=false'] + version_dependent_macros,
+            },
+        )
+    )
+
+if "--index_mul_2d" in sys.argv:
+    sys.argv.remove("--index_mul_2d")
+    raise_if_cuda_home_none("--index_mul_2d")
+    ext_modules.append(
+        CUDAExtension(
+            name='fused_index_mul_2d',
+            sources=[
+                'apex/contrib/csrc/index_mul_2d/index_mul_2d_cuda.cpp',
+                'apex/contrib/csrc/index_mul_2d/index_mul_2d_cuda_kernel.cu',
             ],
             include_dirs=[os.path.join(this_dir, 'csrc')],
             extra_compile_args={

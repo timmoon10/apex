@@ -264,7 +264,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             shape[0] *= world_size
 
             all_gather_buffer = torch.empty(
-                shape, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False,
+                shape,
+                dtype=input.dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=False,
             )
             torch.distributed._all_gather_base(all_gather_buffer, input, group=get_tensor_model_parallel_group())
             total_input = all_gather_buffer
@@ -289,9 +292,11 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 shape, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False,
             )
             handle = torch.distributed._all_gather_base(
-                all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True,
+                all_gather_buffer,
+                input,
+                group=get_tensor_model_parallel_group(),
+                async_op=True,
             )
-
             total_input = all_gather_buffer
         else:
             total_input = input
@@ -305,16 +310,18 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         total_input = total_input.view(total_input.shape[0] * total_input.shape[1], total_input.shape[2])
         if ctx.async_grad_allreduce:
             # Asynchronous all-reduce
-            handle = torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group(), async_op=True)
+            handle = torch.distributed.all_reduce(
+                grad_input, group=get_tensor_model_parallel_group(), async_op=True
+            )
 
         if ctx.sequence_parallel_enabled:
             assert not ctx.async_grad_allreduce
-            sub_grad_input = torch.empty(
-                input.shape, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
-            )
-            # reduce_scatter
+            sub_grad_input = torch.empty(input.shape, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False)
             handle = torch.distributed._reduce_scatter_base(
-                sub_grad_input, grad_input, group=get_tensor_model_parallel_group(), async_op=True
+                sub_grad_input,
+                grad_input,
+                group=get_tensor_model_parallel_group(),
+                async_op=True
             )
 
         if ctx.gradient_accumulation_fusion:
