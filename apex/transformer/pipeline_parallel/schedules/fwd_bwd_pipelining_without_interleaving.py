@@ -252,7 +252,7 @@ def forward_backward_pipelining_without_interleaving(
     deallocate_pipeline_outputs: bool = False,
     async_comm: bool = False,
     sequence_parallel_enabled: bool = False,
-    custom_sync_context_handler = None,
+    custom_sync_context_handler: Optional[Any] = None,
     sync_batch_comm: bool = True,
     **kwargs,
 ) -> List[Union[torch.Tensor, Sequence[torch.Tensor]]]:
@@ -284,9 +284,11 @@ def forward_backward_pipelining_without_interleaving(
         sequence_parallel_enabled: Set to :obj:`True` for this function to handle sequence length.
             When :obj:`True`, the sequence length on each tensor model parallel rank is updated
             to :math:`original\_sequence\_length / tensor\_model\_parallel\_world\_size`.
-        custom_sync_context_handler: Context manager to disable
-            asynchronous gradient reductions. In the first pipeline
-            stage, asynchronous gradient reductions are enabled in the
+        custom_sync_context_handler: Does nothing if ``None`` (default
+            value). Otherwise, this is treated as a function to
+            construct a context manager to disable asynchronous
+            gradient reductions. In the first pipeline stage,
+            asynchronous gradient reductions are enabled in the
             backward pass of the last microbatch. In other pipeline
             stages, asynchronous gradient reductions are disabled and
             gradients must be manually synchronized by the caller (in
