@@ -117,7 +117,7 @@ void tensor_strides(at::Tensor t, bool explicit_nhwc, int& stride_N, int& stride
     }
 }
 
-template<class T> 
+template<class T>
 __device__ void __zero(T* dst)
 {
     *dst = T(0);
@@ -132,8 +132,8 @@ __device__ void __zero(int4* dst)
 
 template<class T, bool is_HWC, bool zero>
 __device__ void strided_copy_kernel(
-	T* dst, const int dst_stride_C, const int dst_stride_H, const int dst_stride_W, 
-	const T* src, const int src_stride_C, const int src_stride_H, const int src_stride_W, 
+	T* dst, const int dst_stride_C, const int dst_stride_H, const int dst_stride_W,
+	const T* src, const int src_stride_C, const int src_stride_H, const int src_stride_W,
 	const int NC, const int NH, const int NW
 	)
 {
@@ -165,107 +165,22 @@ __device__ void strided_copy_kernel(
     }
 }
 
-template<bool top_zero, bool btm_zero> 
-__device__ void checked_signal(
-	volatile int* signal1_flag, volatile int* signal2_flag,
-	const int v1, const int v2, const int v3, const int v4
-	)
+// Waits until the first entry in an int4 flag is non-zero. Should
+// only be called on main thread
+inline __device__ void wait_for_flag(volatile int* flag)
 {
-    cg::this_grid().sync();
-    bool is_main_thread = (blockIdx.x == 0 && threadIdx.x == 0) ? true : false;
-    if (is_main_thread) {
-	// flush all writes to global memory
-	__threadfence_system();
-	// wait for top or bottom neighbor to clear signal
-	register int r1, r2, r3, r4;
-	if (!(top_zero || btm_zero)) {
-	    bool top_zeroed=false, top_done=false;
-	    bool btm_zeroed=false, btm_done=false;
-	    do {
-		do {
-		    if (!top_zeroed) {
-			asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r1), "=r"(r2), "=r"(r3), "=r"(r4) : "l"(signal1_flag) : "memory");
-			if (r1 != v1 || r2 != v2 || r3 != v3 || r4 != v4) top_zeroed = true;
-		    }
-		    if (!btm_zeroed) {
-			asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r1), "=r"(r2), "=r"(r3), "=r"(r4) : "l"(signal2_flag) : "memory");
-			if (r1 != v1 || r2 != v2 || r3 != v3 || r4 != v4) btm_zeroed = true;
-		    }
-		} while((top_zeroed == top_done) && (btm_zeroed == btm_done));
-		if (!top_done && top_zeroed) {
-		    // signal to top neighbor my output is ready
-		    asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" :: "l"(signal1_flag), "r"(v1), "r"(v2), "r"(v3), "r"(v4) : "memory");
-		    top_done = true;
-		}
-		if (!btm_done && btm_zeroed) {
-		    // signal to bottom neighbor my output is ready
-		    asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" :: "l"(signal2_flag), "r"(v1), "r"(v2), "r"(v3), "r"(v4) : "memory");
-		    btm_done = true;
-		}
-	    } while (!top_done || !btm_done);
-	} else if (top_zero) {
-	    bool btm_zeroed=false, btm_done=false;
-	    do {
-		do {
-		    if (!btm_zeroed) {
-			asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r1), "=r"(r2), "=r"(r3), "=r"(r4) : "l"(signal2_flag) : "memory");
-			if (r1 != v1 || r2 != v2 || r3 != v3 || r4 != v4) btm_zeroed = true;
-		    }
-		} while(btm_zeroed == btm_done);
-		if (!btm_done && btm_zeroed) {
-		    // signal to bottom neighbor my output is ready
-		    asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" :: "l"(signal2_flag), "r"(v1), "r"(v2), "r"(v3), "r"(v4) : "memory");
-		    btm_done = true;
-		}
-	    } while (!btm_done);
-
-	} else if (btm_zero) {
-	    bool top_zeroed=false, top_done=false;
-	    do {
-		do {
-		    if (!top_zeroed) {
-			asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r1), "=r"(r2), "=r"(r3), "=r"(r4) : "l"(signal1_flag) : "memory");
-			if (r1 != v1 || r2 != v2 || r3 != v3 || r4 != v4) top_zeroed = true;
-		    }
-		} while(top_zeroed == top_done);
-		if (!top_done && top_zeroed) {
-		    // signal to top neighbor my output is ready
-		    asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" :: "l"(signal1_flag), "r"(v1), "r"(v2), "r"(v3), "r"(v4) : "memory");
-		    top_done = true;
-		}
-	    } while (!top_done);
-	}
-    }
+    register int r1, r2, r3, r4;
+    do {
+        asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r1), "=r"(r2), "=r"(r3), "=r"(r4) : "l"(flag) : "memory");
+    } while (r1 == 0);
 }
 
-__device__ void wait_for(
-	volatile int* wait_flag,
-	const int v1, const int v2, const int v3, const int v4
-	)
+// Sets an int4 flag to {val, 0, 0, 0}. Should only be called on
+// main thread.
+inline __device__ void set_flag(volatile int* flag, const int val)
 {
-    bool is_main_thread = (blockIdx.x == 0 && threadIdx.x == 0) ? true : false;
-    if (is_main_thread) {
-    	register int r1, r2, r3, r4;
-	// wait for senders to signal their output is read
-	do {
-	    asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r1), "=r"(r2), "=r"(r3), "=r"(r4) : "l"(wait_flag) : "memory");
-	} while (r1 != v1 || r2 != v2 || r3 != v3 || r4 != v4);
-    }
-    cg::this_grid().sync();  // all threads wait for main
-}
-
-
-__device__ void clear_flag(
-	volatile int* wait_flag
-	)
-{
-    cg::this_grid().sync();  // wait for all threads in kernel to finish
-    bool is_main_thread = (blockIdx.x == 0 && threadIdx.x == 0) ? true : false;
-    if (is_main_thread) {
-	register int r1, r2, r3, r4;
-	r1 = 0;  r2 = 0;  r3 = 0;  r4 = 0;
-	asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" :: "l"(wait_flag), "r"(r1), "r"(r2), "r"(r3), "r"(r4) : "memory");
-    }
+    register int r1{val}, r2{0}, r3{0}, r4{0};
+    asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" :: "l"(flag), "r"(r1), "r"(r2), "r"(r3), "r"(r4) : "memory");
 }
 
 template<class T, bool is_HWC, bool top_zero, bool btm_zero>
@@ -286,40 +201,70 @@ __global__ void push_pull_halos_1d_kernel(
         // dimensions
         int NC, int NH, int NW,
         // signals
-        int* signal1_flag,
-        int* signal2_flag,
-        int* wait1_flag,
-        int* wait2_flag
+        int* tox_write_ready, int* tox_read_ready,
+        int* tix_write_ready, int* tix_read_ready,
+        int* box_write_ready, int* box_read_ready,
+        int* bix_write_ready, int* bix_read_ready
         )
 {
-    // push top output halo to transfer buffer
-    if (!top_zero) strided_copy_kernel<T,is_HWC,false>(tox, tox_stride_C, tox_stride_H, tox_stride_W, toh, toh_stride_C, toh_stride_H, toh_stride_W, NC, NH, NW);
-    // push btm output halo to transfer buffer
-    if (!btm_zero) strided_copy_kernel<T,is_HWC,false>(box, box_stride_C, box_stride_H, box_stride_W, boh, boh_stride_C, boh_stride_H, boh_stride_W, NC, NH, NW);
-    // signal to top and btm neigbhbors that output halos are ready to be read
-    // the choice of values for v1-v4 is arbitrary and does not matter, as long as all ranks use the same values
-    if (!(top_zero || btm_zero)) {
-	checked_signal<false,false>(signal1_flag, signal2_flag, -987751720, 840868300, -225529332, 281513358);
-    } else if (top_zero) {
-	checked_signal<true,false>(signal1_flag, signal2_flag, -987751720, 840868300, -225529332, 281513358);
-    } else if (btm_zero) {
-	checked_signal<false,true>(signal1_flag, signal2_flag, -987751720, 840868300, -225529332, 281513358);
+    const bool is_main_thread = blockIdx.x == 0 && threadIdx.x == 0;
+
+    // wait until transfer buffers are ready
+    if (is_main_thread) {
+        if (!top_zero) {
+            wait_for_flag(tox_write_ready);
+            set_flag(tox_write_ready, 0);
+        }
+        if (!btm_zero) {
+            wait_for_flag(box_write_ready);
+            set_flag(box_write_ready, 0);
+        }
     }
-    // pull top halo from transfer buffer in peer memory to input
-    if (top_zero) {
-	strided_copy_kernel<T,is_HWC,true>(tih, tih_stride_C, tih_stride_H, tih_stride_W, tix, tix_stride_C, tix_stride_H, tix_stride_W, NC, NH, NW);
-    } else {
-    	wait_for(wait1_flag, -987751720, 840868300, -225529332, 281513358);
-	strided_copy_kernel<T,is_HWC,false>(tih, tih_stride_C, tih_stride_H, tih_stride_W, tix, tix_stride_C, tix_stride_H, tix_stride_W, NC, NH, NW);
-	clear_flag(wait1_flag);
+    cg::this_grid().sync();
+
+    // push halos to transfer buffers
+    if (!top_zero) {
+        strided_copy_kernel<T,is_HWC,false>(tox, tox_stride_C, tox_stride_H, tox_stride_W,
+                                            toh, toh_stride_C, toh_stride_H, toh_stride_W,
+                                            NC, NH, NW);
     }
-    // pull btm halo from transfer buffer in peer memory to input
-    if (btm_zero) {
-	strided_copy_kernel<T,is_HWC,true>(bih, bih_stride_C, bih_stride_H, bih_stride_W, bix, bix_stride_C, bix_stride_H, bix_stride_W, NC, NH, NW);
-    } else {
-	wait_for(wait2_flag, -987751720, 840868300, -225529332, 281513358);
-	strided_copy_kernel<T,is_HWC,false>(bih, bih_stride_C, bih_stride_H, bih_stride_W, bix, bix_stride_C, bix_stride_H, bix_stride_W, NC, NH, NW);
-	clear_flag(wait2_flag);
+    if (!btm_zero) {
+        strided_copy_kernel<T,is_HWC,false>(box, box_stride_C, box_stride_H, box_stride_W,
+                                            boh, boh_stride_C, boh_stride_H, boh_stride_W,
+                                            NC, NH, NW);
+    }
+
+    // synchronize with neighbors
+    cg::this_grid().sync();
+    if (is_main_thread) {
+	__threadfence_system();
+        if (!top_zero) set_flag(tox_read_ready, -1);
+        if (!btm_zero) set_flag(box_read_ready, -1);
+        if (!top_zero) {
+            wait_for_flag(tix_read_ready);
+            set_flag(tix_read_ready, 0);
+        }
+        if (!btm_zero) {
+            wait_for_flag(bix_read_ready);
+            set_flag(bix_read_ready, 0);
+        }
+    }
+    cg::this_grid().sync();
+
+    // pull halos from transfer buffers
+    strided_copy_kernel<T,is_HWC,top_zero>(tih, tih_stride_C, tih_stride_H, tih_stride_W,
+                                           tix, tix_stride_C, tix_stride_H, tix_stride_W,
+                                           NC, NH, NW);
+    strided_copy_kernel<T,is_HWC,btm_zero>(bih, bih_stride_C, bih_stride_H, bih_stride_W, bix,
+                                           bix_stride_C, bix_stride_H, bix_stride_W,
+                                           NC, NH, NW);
+
+    // reset flags
+    cg::this_grid().sync();
+    if (is_main_thread) {
+	__threadfence_system();
+        if (!top_zero) set_flag(tix_write_ready, -1);
+        if (!btm_zero) set_flag(bix_write_ready, -1);
     }
 }
 
@@ -514,10 +459,14 @@ void push_pull_halos_1d(
             scalar_t* bix_p = btm_inp_tx.data_ptr<scalar_t>();
             scalar_t* bih_p = btm_inp_halo.data_ptr<scalar_t>();
 	    if (diagnostics) printf("waypoint1\n");
-	    int* top_signal_p = top_signal.data_ptr<int>() + 4;
-	    int* btm_signal_p = btm_signal.data_ptr<int>();
-	    int* top_wait_p = waits.data_ptr<int>();
-	    int* btm_wait_p = waits.data_ptr<int>() + 4;
+            int* tox_write_ready = waits.data_ptr<int>();
+            int* tox_read_ready = top_signal.data_ptr<int>() + 12; // bix_read_ready in neighbor
+            int* tix_write_ready = top_signal.data_ptr<int>() + 8; // box_write_ready in neighbor
+            int* tix_read_ready = waits.data_ptr<int>() + 4;
+            int* box_write_ready = waits.data_ptr<int>() + 8;
+            int* box_read_ready = btm_signal.data_ptr<int>() + 4; // tix_read_ready in neighbor
+            int* bix_write_ready = btm_signal.data_ptr<int>(); // tox_write_ready in neighbor
+            int* bix_read_ready = waits.data_ptr<int>() + 12;
 	    if (diagnostics) printf("waypoint2\n");
 
             // do int4 vector loads if channel count permits
@@ -559,7 +508,10 @@ void push_pull_halos_1d(
 		    (int4**)&bix_p, &bix_stride_C, &bix_stride_H, &bix_stride_W,
 		    (int4**)&bih_p, &bih_stride_C, &bih_stride_H, &bih_stride_W,
 		    &NC, &NH, &NW,
-		    &top_signal_p, &btm_signal_p, &top_wait_p, &btm_wait_p
+                    &tox_write_ready, &tox_read_ready,
+                    &tix_write_ready, &tix_read_ready,
+                    &box_write_ready, &box_read_ready,
+                    &bix_write_ready, &bix_read_ready
 		};
 		if (top_zero) {
 		    int numBlocksPerSm;
@@ -590,7 +542,10 @@ void push_pull_halos_1d(
 		    &bix_p, &bix_stride_C, &bix_stride_H, &bix_stride_W,
 		    &bih_p, &bih_stride_C, &bih_stride_H, &bih_stride_W,
 		    &NC, &NH, &NW,
-		    &top_signal_p, &btm_signal_p, &top_wait_p, &btm_wait_p
+                    &tox_write_ready, &tox_read_ready,
+                    &tix_write_ready, &tix_read_ready,
+                    &box_write_ready, &box_read_ready,
+                    &bix_write_ready, &bix_read_ready
 		};
                 int numBlocksPerSm;
                 if (is_nhwc) {
@@ -627,4 +582,3 @@ void push_pull_halos_1d(
 }
 
 } } }
-
