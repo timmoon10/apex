@@ -118,31 +118,37 @@ void tensor_strides(at::Tensor t, bool explicit_nhwc, int& stride_N, int& stride
 }
 
 template<class T>
-__device__ void __zero(T* dst)
+inline __device__ void __zero(T* dst)
 {
     *dst = T(0);
 }
 
-__device__ void __zero(int4* dst)
+inline __device__ void __zero(int4* dst)
 {
-    int4 v;
-    v.x = v.y = v.z = v.w = 0;
-    *dst = v;
+    *dst = {0, 0, 0, 0};
 }
 
 template<class T, bool is_HWC, bool zero>
-__device__ void strided_copy_kernel(
-	T* dst, const int dst_stride_C, const int dst_stride_H, const int dst_stride_W,
-	const T* src, const int src_stride_C, const int src_stride_H, const int src_stride_W,
-	const int NC, const int NH, const int NW
+inline __device__ void strided_copy_kernel(
+	T* __restrict__ dst,
+        const int dst_stride_C,
+        const int dst_stride_H,
+        const int dst_stride_W,
+	const T* __restrict__ src,
+        const int src_stride_C,
+        const int src_stride_H,
+        const int src_stride_W,
+	const int NC,
+        const int NH,
+        const int NW
 	)
 {
-    size_t tot_num_threads = gridDim.x * blockDim.x;
-    size_t thread_id = blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t count = NC*NH*NW;
-    for (size_t i = thread_id;  i < count;  i += tot_num_threads)
+    const int tot_num_threads = gridDim.x * blockDim.x;
+    const int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    const int count = NC*NH*NW;
+    for (int i = thread_id;  i < count;  i += tot_num_threads)
     {
-	size_t c,h,w;
+	int c, h, w;
 	if (is_HWC) {
 	    w = i / NC;
 	    c = i - w * NC;
@@ -155,24 +161,24 @@ __device__ void strided_copy_kernel(
 	    c = h / NH;
             h = h - c * NH;
 	}
-	size_t dst_off = c*dst_stride_C + h*dst_stride_H + w*dst_stride_W;
+	int dst_off = c*dst_stride_C + h*dst_stride_H + w*dst_stride_W;
 	if (zero) {
 	    __zero(dst+dst_off);
 	} else {
-	    size_t src_off = c*src_stride_C + h*src_stride_H + w*src_stride_W;
+	    int src_off = c*src_stride_C + h*src_stride_H + w*src_stride_W;
 	    dst[dst_off] = src[src_off];
 	}
     }
 }
 
-// Waits until the first entry in an int4 flag is non-zero. Should
-// only be called on main thread
-inline __device__ void wait_for_flag(volatile int* flag)
+// Waits until the first entry in an int4 flag is set or unset. Should
+// only be called on main thread.
+inline __device__ void wait_for_flag(volatile int* flag, bool wait_until_set)
 {
     register int r1, r2, r3, r4;
     do {
         asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r1), "=r"(r2), "=r"(r3), "=r"(r4) : "l"(flag) : "memory");
-    } while (r1 == 0);
+    } while (wait_until_set ^ (r1 != 0));
 }
 
 // Sets an int4 flag to {val, 0, 0, 0}. Should only be called on
@@ -212,12 +218,12 @@ __global__ void push_pull_halos_1d_kernel(
     // wait until transfer buffers are ready
     if (is_main_thread) {
         if (!top_zero) {
-            wait_for_flag(tox_write_ready);
-            set_flag(tox_write_ready, 0);
+            wait_for_flag(tox_write_ready, false);
+            set_flag(tox_write_ready, -1);
         }
         if (!btm_zero) {
-            wait_for_flag(box_write_ready);
-            set_flag(box_write_ready, 0);
+            wait_for_flag(box_write_ready, false);
+            set_flag(box_write_ready, -1);
         }
     }
     cg::this_grid().sync();
@@ -241,11 +247,11 @@ __global__ void push_pull_halos_1d_kernel(
         if (!top_zero) set_flag(tox_read_ready, -1);
         if (!btm_zero) set_flag(box_read_ready, -1);
         if (!top_zero) {
-            wait_for_flag(tix_read_ready);
+            wait_for_flag(tix_read_ready, true);
             set_flag(tix_read_ready, 0);
         }
         if (!btm_zero) {
-            wait_for_flag(bix_read_ready);
+            wait_for_flag(bix_read_ready, true);
             set_flag(bix_read_ready, 0);
         }
     }
@@ -263,8 +269,8 @@ __global__ void push_pull_halos_1d_kernel(
     cg::this_grid().sync();
     if (is_main_thread) {
 	__threadfence_system();
-        if (!top_zero) set_flag(tix_write_ready, -1);
-        if (!btm_zero) set_flag(bix_write_ready, -1);
+        if (!top_zero) set_flag(tix_write_ready, 0);
+        if (!btm_zero) set_flag(bix_write_ready, 0);
     }
 }
 

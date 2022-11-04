@@ -15,8 +15,6 @@ class PeerHaloExchanger1d:
         self.peer_pool = peer_pool
         self.signals = peer_pool.allocate_peer_tensors([4,4], torch.int32, False, False)
         self.signals[self.peer_rank].zero_()
-        self.signals[self.peer_rank][0,0].fill_(1)
-        self.signals[self.peer_rank][2,0].fill_(1)
         self.half_halo = half_halo
 
     def __call__(self, y, H_split=True, explicit_nhwc=False, numSM=1, diagnostics=False):
