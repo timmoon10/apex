@@ -22,6 +22,9 @@ namespace cg = cooperative_groups;
 
 namespace {
 
+constexpr int THREADS_PER_WARP = 32;
+constexpr int THREADS_PER_CTA = 128;
+
 /* Basic deleter function for from_blob function.
 void deleter(void* ptr)
 {
@@ -140,26 +143,26 @@ inline __device__ void strided_copy_kernel(
         const int src_stride_W,
 	const int NC,
         const int NH,
-        const int NW
+        const int NW,
+        const int thread_id,
+        const int num_threads
 	)
 {
-    const int tot_num_threads = gridDim.x * blockDim.x;
-    const int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
     const int count = NC*NH*NW;
-    for (int i = thread_id;  i < count;  i += tot_num_threads)
+    for (int i = thread_id;  i < count;  i += num_threads)
     {
-	int c, h, w;
+        int c, h, w;
 	if (is_HWC) {
-	    w = i / NC;
-	    c = i - w * NC;
-	    h = w / NW;
-	    w = w - h * NW;
+            const int j = i / NC;
+            c = i % NC;
+	    h = j / NW;
+            w = j % NW;
 	}
 	else {
-	    h = i / NW;
-	    w = i - h * NW;
-	    c = h / NH;
-            h = h - c * NH;
+            const int j = i / NW;
+            w = i % NW;
+	    c = j / NH;
+            h = j % NH;
 	}
 	int dst_off = c*dst_stride_C + h*dst_stride_H + w*dst_stride_W;
 	if (zero) {
@@ -175,7 +178,7 @@ inline __device__ void strided_copy_kernel(
 // only be called on main thread.
 inline __device__ void wait_for_flag(volatile int* flag, bool wait_until_set)
 {
-    register int r1, r2, r3, r4;
+    uint r1, r2, r3, r4;
     do {
         asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(r1), "=r"(r2), "=r"(r3), "=r"(r4) : "l"(flag) : "memory");
     } while (wait_until_set ^ (r1 != 0));
@@ -183,15 +186,15 @@ inline __device__ void wait_for_flag(volatile int* flag, bool wait_until_set)
 
 // Sets an int4 flag to {val, 0, 0, 0}. Should only be called on
 // main thread.
-inline __device__ void set_flag(volatile int* flag, const int val)
+inline __device__ void set_flag(volatile int* flag, const uint val)
 {
-    register int r1{val}, r2{0}, r3{0}, r4{0};
-    asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" :: "l"(flag), "r"(r1), "r"(r2), "r"(r3), "r"(r4) : "memory");
+    const uint zero = 0;
+    asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" :: "l"(flag), "r"(val), "r"(zero), "r"(zero), "r"(zero) : "memory");
 }
 
 template<class T, bool is_HWC, bool top_zero, bool btm_zero>
-#if __CUDA_ARCH__ == 700 || __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 900
-__launch_bounds__(128, 16)
+#if __CUDA_ARCH__ >= 700
+__launch_bounds__(THREADS_PER_CTA)
 #endif
 __global__ void push_pull_halos_1d_kernel(
         // top halo,
@@ -213,64 +216,103 @@ __global__ void push_pull_halos_1d_kernel(
         int* bix_write_ready, int* bix_read_ready
         )
 {
-    const bool is_main_thread = blockIdx.x == 0 && threadIdx.x == 0;
+    // indices
+    static_assert(THREADS_PER_CTA / THREADS_PER_WARP >= 4);
+    const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
+    const int warp_id = threadIdx.x / THREADS_PER_WARP;
+    const int lane_id = threadIdx.x % THREADS_PER_WARP;
+    const int num_blocks_per_side = gridDim.x / 2;
+    const int num_threads_per_side = num_blocks_per_side * THREADS_PER_CTA;
+    const bool in_top_block = blockIdx.x < gridDim.x / 2;
+    const bool in_btm_block = !in_top_block;
+    const int side_thread_id = in_top_block ? thread_id : thread_id - num_threads_per_side;
 
     // wait until transfer buffers are ready
-    if (is_main_thread) {
-        if (!top_zero) {
-            wait_for_flag(tox_write_ready, false);
-            set_flag(tox_write_ready, -1);
-        }
-        if (!btm_zero) {
-            wait_for_flag(box_write_ready, false);
-            set_flag(box_write_ready, -1);
+    if (blockIdx.x == 0 && lane_id == 0) {
+        switch (warp_id) {
+        case 0:
+            if (!top_zero) {
+                wait_for_flag(tox_write_ready, false);
+                set_flag(tox_write_ready, -1);
+            }
+            break;
+        case 1:
+            if (!btm_zero) {
+                wait_for_flag(box_write_ready, false);
+                set_flag(box_write_ready, -1);
+            }
+            break;
         }
     }
     cg::this_grid().sync();
 
     // push halos to transfer buffers
-    if (!top_zero) {
+    if (!top_zero && in_top_block) {
         strided_copy_kernel<T,is_HWC,false>(tox, tox_stride_C, tox_stride_H, tox_stride_W,
                                             toh, toh_stride_C, toh_stride_H, toh_stride_W,
-                                            NC, NH, NW);
+                                            NC, NH, NW,
+                                            side_thread_id, num_threads_per_side);
     }
-    if (!btm_zero) {
+    if (!btm_zero && in_btm_block) {
         strided_copy_kernel<T,is_HWC,false>(box, box_stride_C, box_stride_H, box_stride_W,
                                             boh, boh_stride_C, boh_stride_H, boh_stride_W,
-                                            NC, NH, NW);
+                                            NC, NH, NW,
+                                            side_thread_id, num_threads_per_side);
     }
 
     // synchronize with neighbors
+    __threadfence();
     cg::this_grid().sync();
-    if (is_main_thread) {
-	__threadfence_system();
-        if (!top_zero) set_flag(tox_read_ready, -1);
-        if (!btm_zero) set_flag(box_read_ready, -1);
-        if (!top_zero) {
-            wait_for_flag(tix_read_ready, true);
-            set_flag(tix_read_ready, 0);
-        }
-        if (!btm_zero) {
-            wait_for_flag(bix_read_ready, true);
-            set_flag(bix_read_ready, 0);
+    if (blockIdx.x == 0 && lane_id == 0) {
+        switch (warp_id) {
+        case 0:
+            if (!top_zero) set_flag(tox_read_ready, -1);
+            break;
+        case 1:
+            if (!btm_zero) set_flag(box_read_ready, -1);
+            break;
+        case 2:
+            if (!top_zero) {
+                wait_for_flag(tix_read_ready, true);
+                set_flag(tix_read_ready, 0);
+            }
+            break;
+        case 3:
+            if (!btm_zero) {
+                wait_for_flag(bix_read_ready, true);
+                set_flag(bix_read_ready, 0);
+            }
+            break;
         }
     }
     cg::this_grid().sync();
 
     // pull halos from transfer buffers
-    strided_copy_kernel<T,is_HWC,top_zero>(tih, tih_stride_C, tih_stride_H, tih_stride_W,
-                                           tix, tix_stride_C, tix_stride_H, tix_stride_W,
-                                           NC, NH, NW);
-    strided_copy_kernel<T,is_HWC,btm_zero>(bih, bih_stride_C, bih_stride_H, bih_stride_W, bix,
-                                           bix_stride_C, bix_stride_H, bix_stride_W,
-                                           NC, NH, NW);
+    if (in_top_block) {
+        strided_copy_kernel<T,is_HWC,top_zero>(tih, tih_stride_C, tih_stride_H, tih_stride_W,
+                                               tix, tix_stride_C, tix_stride_H, tix_stride_W,
+                                               NC, NH, NW,
+                                               side_thread_id, num_threads_per_side);
+    }
+    if (in_btm_block) {
+        strided_copy_kernel<T,is_HWC,btm_zero>(bih, bih_stride_C, bih_stride_H, bih_stride_W, bix,
+                                               bix_stride_C, bix_stride_H, bix_stride_W,
+                                               NC, NH, NW,
+                                               side_thread_id, num_threads_per_side);
+    }
 
     // reset flags
+    __threadfence();
     cg::this_grid().sync();
-    if (is_main_thread) {
-	__threadfence_system();
-        if (!top_zero) set_flag(tix_write_ready, 0);
-        if (!btm_zero) set_flag(bix_write_ready, 0);
+    if (blockIdx.x == 0 && lane_id == 0) {
+        switch (warp_id) {
+        case 0:
+            if (!top_zero) set_flag(tix_write_ready, 0);
+            break;
+        case 1:
+            if (!btm_zero) set_flag(bix_write_ready, 0);
+            break;
+        }
     }
 }
 
@@ -359,7 +401,7 @@ at::Tensor blob_view_int(int64_t raw, std::vector<int64_t> shape, bool channels_
 void push_pull_halos_1d(
 	bool diagnostics,
         bool explicit_nhwc,
-        int numSM,                      // number of SMs to use
+        int numSM,                      // number of SMs to use (zero corresponds to all SMs)
 	bool top_zero,			// true if top halo should be zeroed
         at::Tensor top_out_halo,        // top output halo in sender device memory
         at::Tensor top_out_tx,          // top output transfer buffer in sender peer pool memory
@@ -450,10 +492,49 @@ void push_pull_halos_1d(
     cudaGetDevice(&device);
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device);
-    assert(numSM > 0 && numSM <= prop.multiProcessorCount);
+    if (numSM <= 0 || numSM > prop.multiProcessorCount) {
+      numSM = prop.multiProcessorCount;
+    }
     auto current_stream = at::cuda::getCurrentCUDAStream();
-    const int numThreads = 128;
-    dim3 block(numThreads,1,1);
+    dim3 block(THREADS_PER_CTA,1,1);
+
+    // helper macros to launch templated kernel
+#define LAUNCH_PUSH_PULL_HALO_KERNEL_BASE(T, IS_HWC, TOP_ZERO, BTM_ZERO, KERNEL_ARGS, NUM_ELEMENTS) \
+    do {                                                                \
+        int numBlocksPerSm;                                             \
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(                  \
+            &numBlocksPerSm,                                            \
+            push_pull_halos_1d_kernel<T,IS_HWC,TOP_ZERO,BTM_ZERO>,      \
+            THREADS_PER_CTA,                                            \
+            0);                                                         \
+        dim3 grid(numSM*numBlocksPerSm,1,1);                            \
+        if (grid.x % 2 != 0) {                                          \
+            /* require even number of blocks (half for top, half for bottom) */ \
+            grid.x -= 1;                                                \
+        }                                                               \
+        if ((grid.x / 2) * block.x > NUM_ELEMENTS) {                    \
+            /* only need enough blocks to cover top and bottom halo elements */ \
+            grid.x = 2 * ((NUM_ELEMENTS + block.x - 1) / block.x);      \
+        }                                                               \
+        cudaLaunchCooperativeKernel(                                    \
+            (void*)push_pull_halos_1d_kernel<T,IS_HWC,TOP_ZERO,BTM_ZERO>, \
+            grid,                                                       \
+            block,                                                      \
+            KERNEL_ARGS,                                                \
+            0,                                                          \
+            current_stream);                                            \
+    } while (false)
+#define LAUNCH_PUSH_PULL_HALO_KERNEL(T, IS_HWC, KERNEL_ARGS, NUM_ELEMENTS) \
+    do {                                                                \
+        if (top_zero) {                                                 \
+            LAUNCH_PUSH_PULL_HALO_KERNEL_BASE(T, IS_HWC, true, false, kernelArgs, num_elem); \
+        } else if (btm_zero) {                                          \
+            LAUNCH_PUSH_PULL_HALO_KERNEL_BASE(T, IS_HWC, false, true, kernelArgs, num_elem); \
+        } else {                                                        \
+            LAUNCH_PUSH_PULL_HALO_KERNEL_BASE(T, IS_HWC, false, false, kernelArgs, num_elem); \
+        }                                                               \
+    } while (false)
+
     AT_DISPATCH_ALL_TYPES_AND(at::ScalarType::Half, top_out_halo.scalar_type(), "push_pull_halos_1d_kernel", [&]{
 	    if (diagnostics) printf("size(scalar_t) = %ld\n",sizeof(scalar_t));
             scalar_t* toh_p = top_out_halo.data_ptr<scalar_t>();
@@ -519,22 +600,8 @@ void push_pull_halos_1d(
                     &box_write_ready, &box_read_ready,
                     &bix_write_ready, &bix_read_ready
 		};
-		if (top_zero) {
-		    int numBlocksPerSm;
-		    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, push_pull_halos_1d_kernel<int4,true,true,false>, numThreads, 0);
-		    dim3 grid(numSM*numBlocksPerSm,1,1);
-		    cudaLaunchCooperativeKernel((void*)push_pull_halos_1d_kernel<int4,true,true,false>, grid, block, kernelArgs, 0, current_stream);
-		} else if (btm_zero) {
-		    int numBlocksPerSm;
-		    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, push_pull_halos_1d_kernel<int4,true,false,true>, numThreads, 0);
-		    dim3 grid(numSM*numBlocksPerSm,1,1);
-		    cudaLaunchCooperativeKernel((void*)push_pull_halos_1d_kernel<int4,true,false,true>, grid, block, kernelArgs, 0, current_stream);
-		} else {
-		    int numBlocksPerSm;
-		    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, push_pull_halos_1d_kernel<int4,true,false,false>, numThreads, 0);
-		    dim3 grid(numSM*numBlocksPerSm,1,1);
-		    cudaLaunchCooperativeKernel((void*)push_pull_halos_1d_kernel<int4,true,false,false>, grid, block, kernelArgs, 0, current_stream);
-		}
+                int num_elem = NC*NH*NW;
+                LAUNCH_PUSH_PULL_HALO_KERNEL(int4, true, kernelArgs, num_elem);
             } else {
                 // cannot do int4 transfers
 		if (diagnostics) printf("CAN NOT DO INT4\n");
@@ -553,38 +620,17 @@ void push_pull_halos_1d(
                     &box_write_ready, &box_read_ready,
                     &bix_write_ready, &bix_read_ready
 		};
-                int numBlocksPerSm;
+                int num_elem = NC*NH*NW;
                 if (is_nhwc) {
-		    if (top_zero) {
-			cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, push_pull_halos_1d_kernel<scalar_t,true,true,false>, numThreads, 0);
-			dim3 grid(numSM*numBlocksPerSm,1,1);
-			cudaLaunchCooperativeKernel((void*)push_pull_halos_1d_kernel<scalar_t,true,true,false>, grid, block, kernelArgs, 0, current_stream);
-		    } else if (btm_zero) {
-			cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, push_pull_halos_1d_kernel<scalar_t,true,false,true>, numThreads, 0);
-			dim3 grid(numSM*numBlocksPerSm,1,1);
-			cudaLaunchCooperativeKernel((void*)push_pull_halos_1d_kernel<scalar_t,true,false,true>, grid, block, kernelArgs, 0, current_stream);
-		    } else {
-			cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, push_pull_halos_1d_kernel<scalar_t,true,false,false>, numThreads, 0);
-			dim3 grid(numSM*numBlocksPerSm,1,1);
-			cudaLaunchCooperativeKernel((void*)push_pull_halos_1d_kernel<scalar_t,true,false,false>, grid, block, kernelArgs, 0, current_stream);
-		    }
+                    LAUNCH_PUSH_PULL_HALO_KERNEL(scalar_t, true, kernelArgs, num_elem);
                 } else {
-		    if (top_zero) {
-			cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, push_pull_halos_1d_kernel<scalar_t,false,true,false>, numThreads, 0);
-			dim3 grid(numSM*numBlocksPerSm,1,1);
-			cudaLaunchCooperativeKernel((void*)push_pull_halos_1d_kernel<scalar_t,false,true,false>, grid, block, kernelArgs, 0, current_stream);
-		    } else if (btm_zero) {
-			cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, push_pull_halos_1d_kernel<scalar_t,false,false,true>, numThreads, 0);
-			dim3 grid(numSM*numBlocksPerSm,1,1);
-			cudaLaunchCooperativeKernel((void*)push_pull_halos_1d_kernel<scalar_t,false,false,true>, grid, block, kernelArgs, 0, current_stream);
-		    } else {
-			cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, push_pull_halos_1d_kernel<scalar_t,false,false,false>, numThreads, 0);
-			dim3 grid(numSM*numBlocksPerSm,1,1);
-			cudaLaunchCooperativeKernel((void*)push_pull_halos_1d_kernel<scalar_t,false,false,false>, grid, block, kernelArgs, 0, current_stream);
-		    }
+                    LAUNCH_PUSH_PULL_HALO_KERNEL(scalar_t, false, kernelArgs, num_elem);
                 }
 	    }
         } );
+
+#undef LAUNCH_PUSH_PULL_HALO_KERNEL_BASE
+#undef LAUNCH_PUSH_PULL_HALO_KERNEL
 }
 
 } } }
