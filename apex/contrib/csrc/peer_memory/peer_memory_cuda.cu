@@ -22,7 +22,6 @@ namespace cg = cooperative_groups;
 
 namespace {
 
-constexpr int THREADS_PER_WARP = 32;
 constexpr int THREADS_PER_CTA = 128;
 
 /* Basic deleter function for from_blob function.
@@ -217,101 +216,92 @@ __global__ void push_pull_halos_1d_kernel(
         )
 {
     // indices
-    static_assert(THREADS_PER_CTA / THREADS_PER_WARP >= 4);
     const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
-    const int warp_id = threadIdx.x / THREADS_PER_WARP;
-    const int lane_id = threadIdx.x % THREADS_PER_WARP;
-    const int num_blocks_per_side = gridDim.x / 2;
-    const int num_threads_per_side = num_blocks_per_side * THREADS_PER_CTA;
-    const bool in_top_block = blockIdx.x < gridDim.x / 2;
-    const bool in_btm_block = !in_top_block;
+    const int num_threads_per_side = (gridDim.x / 2) * blockDim.x;
+    const bool in_top_block = thread_id < num_threads_per_side;
     const int side_thread_id = in_top_block ? thread_id : thread_id - num_threads_per_side;
 
-    // wait until transfer buffers are ready
-    if (blockIdx.x == 0 && lane_id == 0) {
-        switch (warp_id) {
-        case 0:
-            if (!top_zero) {
-                wait_for_flag(tox_write_ready, false);
-                set_flag(tox_write_ready, -1);
-            }
-            break;
-        case 1:
-            if (!btm_zero) {
-                wait_for_flag(box_write_ready, false);
-                set_flag(box_write_ready, -1);
-            }
-            break;
-        }
-    }
-    cg::this_grid().sync();
-
     // push halos to transfer buffers
-    if (!top_zero && in_top_block) {
-        strided_copy_kernel<T,is_HWC,false>(tox, tox_stride_C, tox_stride_H, tox_stride_W,
-                                            toh, toh_stride_C, toh_stride_H, toh_stride_W,
-                                            NC, NH, NW,
-                                            side_thread_id, num_threads_per_side);
-    }
-    if (!btm_zero && in_btm_block) {
-        strided_copy_kernel<T,is_HWC,false>(box, box_stride_C, box_stride_H, box_stride_W,
-                                            boh, boh_stride_C, boh_stride_H, boh_stride_W,
-                                            NC, NH, NW,
-                                            side_thread_id, num_threads_per_side);
-    }
-
-    // synchronize with neighbors
-    __threadfence();
-    cg::this_grid().sync();
-    if (blockIdx.x == 0 && lane_id == 0) {
-        switch (warp_id) {
-        case 0:
-            if (!top_zero) set_flag(tox_read_ready, -1);
-            break;
-        case 1:
-            if (!btm_zero) set_flag(box_read_ready, -1);
-            break;
-        case 2:
-            if (!top_zero) {
-                wait_for_flag(tix_read_ready, true);
-                set_flag(tix_read_ready, 0);
+    if (in_top_block) {
+        if (!top_zero) {
+            if (threadIdx.x == 0) {
+                wait_for_flag(tox_write_ready, false);
             }
-            break;
-        case 3:
-            if (!btm_zero) {
-                wait_for_flag(bix_read_ready, true);
-                set_flag(bix_read_ready, 0);
+            __syncthreads();
+            strided_copy_kernel<T,is_HWC,false>(tox, tox_stride_C, tox_stride_H, tox_stride_W,
+                                                toh, toh_stride_C, toh_stride_H, toh_stride_W,
+                                                NC, NH, NW,
+                                                side_thread_id, num_threads_per_side);
+        }
+    } else {
+        if (!btm_zero) {
+            if (threadIdx.x == 0) {
+                wait_for_flag(box_write_ready, false);
             }
-            break;
+            __syncthreads();
+            strided_copy_kernel<T,is_HWC,false>(box, box_stride_C, box_stride_H, box_stride_W,
+                                                boh, boh_stride_C, boh_stride_H, boh_stride_W,
+                                                NC, NH, NW,
+                                                side_thread_id, num_threads_per_side);
         }
     }
+
+    // send signal to neighbors that transfer buffer is ready to read
+    __threadfence_system();
     cg::this_grid().sync();
+    if (side_thread_id == 0) {
+        if (in_top_block) {
+            if (!top_zero) {
+                set_flag(tox_write_ready, 0xffffffff);
+                __threadfence_system();
+                set_flag(tox_read_ready, 0xffffffff);
+            }
+        } else {
+            if (!btm_zero) {
+                set_flag(box_write_ready, 0xffffffff);
+                __threadfence_system();
+                set_flag(box_read_ready, 0xffffffff);
+            }
+        }
+    }
 
     // pull halos from transfer buffers
     if (in_top_block) {
+        if (threadIdx.x == 0) {
+            wait_for_flag(tix_read_ready, true);
+        }
+        __syncthreads();
         strided_copy_kernel<T,is_HWC,top_zero>(tih, tih_stride_C, tih_stride_H, tih_stride_W,
                                                tix, tix_stride_C, tix_stride_H, tix_stride_W,
                                                NC, NH, NW,
                                                side_thread_id, num_threads_per_side);
-    }
-    if (in_btm_block) {
+    } else {
+        if (threadIdx.x == 0) {
+            wait_for_flag(bix_read_ready, true);
+        }
+        __syncthreads();
         strided_copy_kernel<T,is_HWC,btm_zero>(bih, bih_stride_C, bih_stride_H, bih_stride_W, bix,
                                                bix_stride_C, bix_stride_H, bix_stride_W,
                                                NC, NH, NW,
                                                side_thread_id, num_threads_per_side);
     }
 
-    // reset flags
-    __threadfence();
+    // send signal to neighbors that transfer buffer is ready to write
+    __threadfence_system();
     cg::this_grid().sync();
-    if (blockIdx.x == 0 && lane_id == 0) {
-        switch (warp_id) {
-        case 0:
-            if (!top_zero) set_flag(tix_write_ready, 0);
-            break;
-        case 1:
-            if (!btm_zero) set_flag(bix_write_ready, 0);
-            break;
+    if (side_thread_id == 0) {
+        if (in_top_block) {
+            if (!top_zero) {
+                set_flag(tix_read_ready, 0);
+                __threadfence_system();
+                set_flag(tix_write_ready, 0);
+            }
+        } else {
+            if (!btm_zero) {
+                set_flag(bix_read_ready, 0);
+                __threadfence_system();
+                set_flag(bix_write_ready, 0);
+            }
         }
     }
 }
@@ -527,11 +517,11 @@ void push_pull_halos_1d(
 #define LAUNCH_PUSH_PULL_HALO_KERNEL(T, IS_HWC, KERNEL_ARGS, NUM_ELEMENTS) \
     do {                                                                \
         if (top_zero) {                                                 \
-            LAUNCH_PUSH_PULL_HALO_KERNEL_BASE(T, IS_HWC, true, false, kernelArgs, num_elem); \
+          LAUNCH_PUSH_PULL_HALO_KERNEL_BASE(T, IS_HWC, true, false, KERNEL_ARGS, NUM_ELEMENTS); \
         } else if (btm_zero) {                                          \
-            LAUNCH_PUSH_PULL_HALO_KERNEL_BASE(T, IS_HWC, false, true, kernelArgs, num_elem); \
+            LAUNCH_PUSH_PULL_HALO_KERNEL_BASE(T, IS_HWC, false, true, KERNEL_ARGS, NUM_ELEMENTS); \
         } else {                                                        \
-            LAUNCH_PUSH_PULL_HALO_KERNEL_BASE(T, IS_HWC, false, false, kernelArgs, num_elem); \
+            LAUNCH_PUSH_PULL_HALO_KERNEL_BASE(T, IS_HWC, false, false, KERNEL_ARGS, NUM_ELEMENTS); \
         }                                                               \
     } while (false)
 
