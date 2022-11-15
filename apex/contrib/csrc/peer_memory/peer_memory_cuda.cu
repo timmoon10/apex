@@ -357,15 +357,15 @@ void push_pull_halos_1d(
         bool explicit_nhwc,
         int numSM,                      // number of SMs to use (zero corresponds to all SMs)
 	bool top_zero,			// if top halo should be zeroed
-        at::Tensor top_out_halo,        // top output halo buffer (in local device memory, received from top neighbor)
+        at::Tensor top_in_halo,         // top input halo buffer (in local device memory, sent to top neighbor)
 	at::Tensor top_in_transfer,	// top input transfer buffer (in local peer memory)
         at::Tensor top_out_transfer,    // top output transfer buffer (in top neighbor peer memory)
-        at::Tensor top_in_halo,         // top input halo buffer (in local device memory, sent to top neighbor)
+        at::Tensor top_out_halo,        // top output halo buffer (in local device memory, received from top neighbor)
 	bool btm_zero,			// if btm halo should be zeroed
-        at::Tensor btm_out_halo,        // btm output halo buffer (in local device memory, received from btm neighbor)
+        at::Tensor btm_in_halo,         // btm input halo buffer (in local device memory, sent to btm neighbor)
 	at::Tensor btm_in_transfer,	// btm input transfer buffer (in local peer memory)
         at::Tensor btm_out_transfer,    // btm output transfer buffer (in btm neighbor peer memory)
-        at::Tensor btm_in_halo          // btm input halo buffer (in local device memory, sent to btm neighbor)
+        at::Tensor btm_out_halo         // btm output halo buffer (in local device memory, received from btm neighbor)
         )
 {
     // basic checks of inputs
