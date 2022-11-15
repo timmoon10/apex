@@ -94,8 +94,6 @@ class HaloExchangerPeer(HaloExchanger):
         self.explicit_nhwc = explicit_nhwc
         self.numSM = numSM
         self.peer_pool = peer_pool
-        self.signals = peer_pool.allocate_peer_tensors([2,4], torch.int32, False, False)
-        self.signals[self.rank_in_group].zero_()
 
     def left_right_halo_exchange(self, left_output_halo, right_output_halo, left_input_halo=None, right_input_halo=None):
         inplace = False if left_input_halo is None and right_input_halo is None else True
@@ -103,13 +101,14 @@ class HaloExchangerPeer(HaloExchanger):
             left_input_halo = torch.empty_like(right_output_halo)
             right_input_halo = torch.empty_like(left_output_halo)
         channels_last = left_output_halo.is_contiguous(memory_format=torch.channels_last) and not self.explicit_nhwc
-        left_tx = self.peer_pool.allocate_peer_tensors(list(left_output_halo.shape), left_output_halo.dtype, channels_last, True)
-        right_tx = self.peer_pool.allocate_peer_tensors(list(right_output_halo.shape), right_output_halo.dtype, channels_last, True)
+        left_halo_shape = [1,1,1,2*left_output_halo.numel()]
+        right_halo_shape = [1,1,1,2*right_output_halo.numel()]
+        left_tx = self.peer_pool.allocate_peer_tensors(left_halo_shape, left_output_halo.dtype, False, True)
+        right_tx = self.peer_pool.allocate_peer_tensors(right_halo_shape, right_output_halo.dtype, False, True)
         pm.push_pull_halos_1d(
                 self.diagnostics, self.explicit_nhwc, self.numSM,
                 self.left_zero, left_output_halo,  left_tx[self.rank_in_group],  right_tx[self.wrap_around_left_rank_in_group], left_input_halo,
                 self.right_zero, right_output_halo, right_tx[self.rank_in_group], left_tx[self.wrap_around_right_rank_in_group],  right_input_halo,
-                self.signals[self.wrap_around_left_rank_in_group], self.signals[self.wrap_around_right_rank_in_group], self.signals[self.rank_in_group]
                 )
         if not inplace:
             return left_input_halo, right_input_halo

@@ -130,16 +130,16 @@ inline __device__ void __zero(int2* dst)
 
 template<class T, bool channels_last, bool zero>
 inline __device__ void push_pull_tensor(
-        const T* __restrict__ data_in,  // local memory
+        const T* __restrict__ data_in,
         const int data_in_stride_C,
         const int data_in_stride_H,
         const int data_in_stride_W,
-        int4* transfer_out,             // remote peer memory
-        int4* transfer_in,              // local peer memory
-	T* __restrict__ data_out,       // local memory
+	T* __restrict__ data_out,
         const int data_out_stride_C,
         const int data_out_stride_H,
         const int data_out_stride_W,
+        int4* local_peer,
+        int4* remote_peer,
 	const int NC,
         const int NH,
         const int NW,
@@ -147,8 +147,6 @@ inline __device__ void push_pull_tensor(
         const int num_threads
 	)
 {
-    const int count = NC*NH*NW;
-
     // communicate in 128b chunks
     // Note: NVLink flit size is 128b=16B. Use last 4B as a semaphore.
     static_assert(sizeof(T) <= 12);
@@ -157,70 +155,9 @@ inline __device__ void push_pull_tensor(
         uint uints[4];
     };
 
-    // transfer buffers are contiguous
-    int transfer_stride_C, transfer_stride_H, transfer_stride_W;
-    if (channels_last) {
-      transfer_stride_C = 1;
-      transfer_stride_H = NC;
-      transfer_stride_W = NW*NC;
-    } else {
-      transfer_stride_C = NH*HW;
-      transfer_stride_H = NW;
-      transfer_stride_W = 1;
-    }
-
-    // send data to peer GPU
-    if (!zero) {
-        for (int i = thread_id;  i < count;  i += num_threads) {
-            // calculate position in buffers
-            int c, h, w;
-            if (channels_last) {
-                const int j = i / NC;
-                c = i % NC;
-                h = j / NW;
-                w = j % NW;
-            } else {
-                const int j = i / NW;
-                w = i % NW;
-                c = j / NH;
-                h = j % NH;
-            }
-            const T& in = data_in[c*data_in_stride_C + h*data_in_stride_H + w*data_in_stride_W];
-            int4& out = transfer_out[c*transfer_stride_C + h*transfer_stride_H + w*transfer_stride_W];
-
-            // pack value into flit
-            Flit flit;
-            flit.payload = in;
-            flit.uints[3] = 0xffffffff;
-
-            // make sure peer buffer is ready
-            // TODO Use double-buffering to allow push-only communication
-            volatile int* ptr = reinterpret_cast<volatile int*>(&out);
-            uint not_ready = 0xffffffff;
-            do {
-                uint r1, r2, r3;;
-                asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" :
-                             "=r"(r1),
-                             "=r"(r2),
-                             "=r"(r3),
-                             "=r"(not_ready)
-                             : "l"(ptr) : "memory");
-            } while (not_ready != 0);
-
-            // send flit to peer
-            asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::
-                         "l"(ptr),
-                         "r"(flit.uints[0]),
-                         "r"(flit.uints[1]),
-                         "r"(flit.uints[2]),
-                         "r"(flit.uints[3])
-                         : "memory");
-        }
-    }
-
-    // recieve data from peer GPU
-    for (int i = thread_id;  i < count;  i += num_threads) {
-        // calculate position in buffers
+    const int count = NC*NH*NW;
+    for (int i = thread_id; i < count; i += num_threads) {
+        // calculate buffer positions
         int c, h, w;
         if (channels_last) {
             const int j = i / NC;
@@ -233,27 +170,62 @@ inline __device__ void push_pull_tensor(
             c = j / NH;
             h = j % NH;
         }
-        int4& in = transfer_in[c*transfer_stride_C + h*transfer_stride_H + w*transfer_stride_W];
-        T& out = data_out[c*data_out_stride_C + h*data_out_stride_H + w*data_out_stride_W];
+
+        // buffer entries
+        const T& ih = data_in[c*data_in_stride_C + h*data_in_stride_H + w*data_in_stride_W];
+        volatile int* ox_ptr = reinterpret_cast<volatile int*>(remote_peer + thread_id);
+        volatile int* ix_ptr = reinterpret_cast<volatile int*>(local_peer + thread_id);
+        T& oh = data_out[c*data_out_stride_C + h*data_out_stride_H + w*data_out_stride_W];
 
         if (zero) {
-	    __zero(&out);
+	    __zero(&oh);
         } else {
-            // wait to recieve flit from peer
-            Flit flit;
-            volatile int* ptr = reinterpret_cast<volatile int*>(&in);
+            // pack value into flit
+            Flit ox;
+            ox.payload = ih;
+            ox.uints[3] = 0xffffffff;
+
+            // make sure peer buffer is ready
+            // TODO consider double-buffering for push-only communication
+            Flit is_not_ready;
             do {
                 asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" :
-                             "=r"(flit.uints[0]),
-                             "=r"(flit.uints[1]),
-                             "=r"(flit.uints[2]),
-                             "=r"(flit.uints[3])
-                             : "l"(ptr) : "memory");
-            } while (flit.uints[3] == 0);
-            in = {0, 0, 0, 0};
+                             "=r"(is_not_ready.uints[0]),
+                             "=r"(is_not_ready.uints[1]),
+                             "=r"(is_not_ready.uints[2]),
+                             "=r"(is_not_ready.uints[3])
+                             : "l"(ox_ptr) : "memory");
+            } while (is_not_ready.uints[3] != 0);
+
+            // send flit to peer
+            asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::
+                         "l"(ox_ptr),
+                         "r"(ox.uints[0]),
+                         "r"(ox.uints[1]),
+                         "r"(ox.uints[2]),
+                         "r"(ox.uints[3])
+                         : "memory");
+
+            // wait to recieve flit from peer
+            Flit ix;
+            do {
+                asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" :
+                             "=r"(ix.uints[0]),
+                             "=r"(ix.uints[1]),
+                             "=r"(ix.uints[2]),
+                             "=r"(ix.uints[3])
+                             : "l"(ix_ptr) : "memory");
+            } while (ix.uints[3] == 0);
+            asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::
+                         "l"(ix_ptr),
+                         "n"(0),
+                         "n"(0),
+                         "n"(0),
+                         "n"(0)
+                         : "memory");
 
             // unpack value from flit
-            out = flit.payload;
+            oh = ix.payload;
         }
     }
 }
@@ -264,15 +236,15 @@ __launch_bounds__(THREADS_PER_CTA)
 #endif
 __global__ void push_pull_halos_1d_kernel(
         // top halo,
-        const T* tih, int tih_stride_C, int tih_stride_H, int tih_stride_W,     // top input halo (local)
-        T* tox,                                                                 // top output transfer buffer (remote peer)
-        T* tix,                                                                 // top input transfer buffer (local peer)
         T* toh, int toh_stride_C, int toh_stride_H, int toh_stride_W,           // top output halo (local)
+        const T* tih, int tih_stride_C, int tih_stride_H, int tih_stride_W,     // top input halo (local)
+        int4* tox,                                                              // top output transfer buffer (remote peer)
+        int4* tix,                                                              // top input transfer buffer (local peer)
         // btm halo
-        const T* bih, int bih_stride_C, int bih_stride_H, int bih_stride_W,     // btm input halo (local)
-        T* box,                                                                 // btm output transfer buffer (remote peer)
-        T* bix,                                                                 // btm input transfer buffer (local peer)
         T* boh, int boh_stride_C, int boh_stride_H, int boh_stride_W,           // btm output halo (local)
+        const T* bih, int bih_stride_C, int bih_stride_H, int bih_stride_W,     // btm input halo (local)
+        int4* box,                                                              // btm output transfer buffer (remote peer)
+        int4* bix,                                                              // btm input transfer buffer (local peer)
         // dimensions
         int NC, int NH, int NW
         )
@@ -284,17 +256,15 @@ __global__ void push_pull_halos_1d_kernel(
     if (in_top_block) {
         push_pull_tensor<T,channels_last,top_zero>(
             tih, tih_stride_C, tih_stride_H, tih_stride_W,
-            tox,
-            tix,
             toh, toh_stride_C, toh_stride_H, toh_stride_W,
+            tix, tox,
             NC, NH, NW,
             side_thread_id, num_threads_per_side);
     } else {
         push_pull_tensor<T,channels_last,btm_zero>(
             bih, bih_stride_C, bih_stride_H, bih_stride_W,
-            box,
-            bix,
             boh, boh_stride_C, boh_stride_H, boh_stride_W,
+            bix, box,
             NC, NH, NW,
             side_thread_id, num_threads_per_side);
     }
@@ -387,15 +357,15 @@ void push_pull_halos_1d(
         bool explicit_nhwc,
         int numSM,                      // number of SMs to use (zero corresponds to all SMs)
 	bool top_zero,			// if top halo should be zeroed
-        at::Tensor top_in_halo,         // top input halo buffer (in local device memory, sent to top neighbor)
-        at::Tensor top_out_transfer,    // top output transfer buffer (in top neighbor peer memory)
-	at::Tensor top_in_transfer,	// top input transfer buffer (in local peer memory)
         at::Tensor top_out_halo,        // top output halo buffer (in local device memory, received from top neighbor)
+	at::Tensor top_in_transfer,	// top input transfer buffer (in local peer memory)
+        at::Tensor top_out_transfer,    // top output transfer buffer (in top neighbor peer memory)
+        at::Tensor top_in_halo,         // top input halo buffer (in local device memory, sent to top neighbor)
 	bool btm_zero,			// if btm halo should be zeroed
-        at::Tensor btm_in_halo,         // btm input halo buffer (in local device memory, sent to btm neighbor)
-        at::Tensor btm_out_transfer,    // btm output transfer buffer (in btm neighbor peer memory)
+        at::Tensor btm_out_halo,        // btm output halo buffer (in local device memory, received from btm neighbor)
 	at::Tensor btm_in_transfer,	// btm input transfer buffer (in local peer memory)
-        at::Tensor btm_out_halo         // btm output halo buffer (in local device memory, received from btm neighbor)
+        at::Tensor btm_out_transfer,    // btm output transfer buffer (in btm neighbor peer memory)
+        at::Tensor btm_in_halo          // btm input halo buffer (in local device memory, sent to btm neighbor)
         )
 {
     // basic checks of inputs
@@ -448,10 +418,12 @@ void push_pull_halos_1d(
     if (!top_zero) {
         TORCH_CHECK(top_out_transfer.is_contiguous());
         TORCH_CHECK(top_in_transfer.is_contiguous());
+        TORCH_CHECK(tox_size == tix_size);
     }
     if (!btm_zero) {
         TORCH_CHECK(btm_out_transfer.is_contiguous());
         TORCH_CHECK(btm_in_transfer.is_contiguous());
+        TORCH_CHECK(box_size == bix_size);
     }
 
     // figure out launch parameters
@@ -468,16 +440,7 @@ void push_pull_halos_1d(
     // helper macros to launch templated kernel
 #define LAUNCH_PUSH_PULL_HALO_KERNEL_BASE(T, IS_HWC, TOP_ZERO, BTM_ZERO, KERNEL_ARGS, NUM_ELEMENTS) \
     do {                                                                \
-        /* require 128b peer memory per element */                      \
-        int peer_memory_size = NUM_ELEMENTS * 16;                       \
-        if (!TOP_ZERO) {                                                \
-            TORCH_CHECK(tox_size >= peer_memory_size && tix_size >= peer_memory_size); \
-        }                                                               \
-        if (!BTM_ZERO) {                                                \
-            TORCH_CHECK(box_size >= peer_memory_size && bix_size >= peer_memory_size); \
-        }                                                               \
-                                                                        \
-        /* launch kernel */                                             \
+        /* kernel configuration */                                      \
         int numBlocksPerSm;                                             \
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(                  \
             &numBlocksPerSm,                                            \
@@ -493,6 +456,21 @@ void push_pull_halos_1d(
             /* only need enough blocks to cover top and bottom halo elements */ \
             grid.x = 2 * ((NUM_ELEMENTS + block.x - 1) / block.x);      \
         }                                                               \
+        if (!TOP_ZERO) {                                                \
+            /* require 128b=16B peer memory per thread */               \
+            if ((grid.x / 2) * block.x * 16 > tox_size) {               \
+                grid.x = 2 * (tox_size / (block.x * 16));               \
+            }                                                           \
+        }                                                               \
+        if (!BTM_ZERO) {                                                \
+            /* require 128b=16B peer memory per thread */               \
+            if ((grid.x / 2) * block.x * 16 > box_size) {               \
+                grid.x = 2 * (box_size / (block.x * 16));               \
+            }                                                           \
+        }                                                               \
+        TORCH_CHECK(grid.x >= 2);                                       \
+                                                                        \
+        /* launch kernel */                                             \
         cudaLaunchCooperativeKernel(                                    \
             (void*)push_pull_halos_1d_kernel<T,IS_HWC,TOP_ZERO,BTM_ZERO>, \
             grid,                                                       \
@@ -514,14 +492,14 @@ void push_pull_halos_1d(
 
     AT_DISPATCH_ALL_TYPES_AND(at::ScalarType::Half, top_out_halo.scalar_type(), "push_pull_halos_1d_kernel", [&]{
 	if (diagnostics) printf("size(scalar_t) = %ld\n",sizeof(scalar_t));
-        scalar_t* tih_p = top_inp_halo.data_ptr<scalar_t>();
-        int4* tox_p = top_out_tx.data_ptr<int4>();
-        int4* tix_p = top_inp_tx.data_ptr<int4>();
         scalar_t* toh_p = top_out_halo.data_ptr<scalar_t>();
-        scalar_t* bih_p = btm_inp_halo.data_ptr<scalar_t>();
-        int4* box_p = btm_out_tx.data_ptr<int4>();
-        int4* bix_p = btm_inp_tx.data_ptr<int4>();
+        scalar_t* tih_p = top_in_halo.data_ptr<scalar_t>();
+        int4* tox_p = reinterpret_cast<int4*>(top_out_transfer.data_ptr<scalar_t>());
+        int4* tix_p = reinterpret_cast<int4*>(top_in_transfer.data_ptr<scalar_t>());
         scalar_t* boh_p = btm_out_halo.data_ptr<scalar_t>();
+        scalar_t* bih_p = btm_in_halo.data_ptr<scalar_t>();
+        int4* box_p = reinterpret_cast<int4*>(btm_out_transfer.data_ptr<scalar_t>());
+        int4* bix_p = reinterpret_cast<int4*>(btm_in_transfer.data_ptr<scalar_t>());
         if (diagnostics) printf("waypoint1\n");
 
         // do int2 vector loads if channel count permits
@@ -533,12 +511,8 @@ void push_pull_halos_1d(
             int divisor = 8 / sizeof(scalar_t);
             if (diagnostics) printf("CAN DO INT2 :: divisor = %d\n",divisor);
             toh_stride_N /= divisor;   toh_stride_H /= divisor;    toh_stride_W /= divisor;
-            tox_stride_N /= divisor;   tox_stride_H /= divisor;    tox_stride_W /= divisor;
-            tix_stride_N /= divisor;   tix_stride_H /= divisor;    tix_stride_W /= divisor;
             tih_stride_N /= divisor;   tih_stride_H /= divisor;    tih_stride_W /= divisor;
             boh_stride_N /= divisor;   boh_stride_H /= divisor;    boh_stride_W /= divisor;
-            box_stride_N /= divisor;   box_stride_H /= divisor;    box_stride_W /= divisor;
-            bix_stride_N /= divisor;   bix_stride_H /= divisor;    bix_stride_W /= divisor;
             bih_stride_N /= divisor;   bih_stride_H /= divisor;    bih_stride_W /= divisor;
             NC /= divisor;
             if (diagnostics) {
@@ -550,14 +524,12 @@ void push_pull_halos_1d(
                 printf("NC=%d, NH=%d, NW=%d\n",NC,NH,NW);
             }
             void *kernel_args[] = {
-                (int2**)&tih_p, &tih_stride_C, &tih_stride_H, &tih_stride_W,
-                &tox_p,
-                &tix_p,
                 (int2**)&toh_p, &toh_stride_C, &toh_stride_H, &toh_stride_W,
-                (int2**)&bih_p, &bih_stride_C, &bih_stride_H, &bih_stride_W,
-                &box_p,
-                &bix_p,
+                (int2**)&tih_p, &tih_stride_C, &tih_stride_H, &tih_stride_W,
+                &tox_p, &tix_p,
                 (int2**)&boh_p, &boh_stride_C, &boh_stride_H, &boh_stride_W,
+                (int2**)&bih_p, &bih_stride_C, &bih_stride_H, &bih_stride_W,
+                &box_p, &bix_p,
                 &NC, &NH, &NW
             };
             int num_elem = NC*NH*NW;
@@ -566,14 +538,12 @@ void push_pull_halos_1d(
             // cannot do int2 transfers
             if (diagnostics) printf("CAN NOT DO INT2\n");
             void *kernel_args[] = {
-		&tih_p, &tih_stride_C, &tih_stride_H, &tih_stride_W,
-                &tox_p,
-                &tix_p,
                 &toh_p, &toh_stride_C, &toh_stride_H, &toh_stride_W,
-                &bih_p, &bih_stride_C, &bih_stride_H, &bih_stride_W,
-                &box_p,
-                &bix_p,
+		&tih_p, &tih_stride_C, &tih_stride_H, &tih_stride_W,
+                &tox_p, &tix_p,
                 &boh_p, &boh_stride_C, &boh_stride_H, &boh_stride_W,
+                &bih_p, &bih_stride_C, &bih_stride_H, &bih_stride_W,
+                &box_p, &bix_p,
                 &NC, &NH, &NW
             };
             int num_elem = NC*NH*NW;
