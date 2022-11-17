@@ -32,6 +32,7 @@ namespace apex { namespace contrib { namespace peer_memory {
         bool diagnostics,
         bool explicit_nhwc,
         int numSM,                      // number of SMs to use
+        int peer_rank,                  // rank in spatial parallel group
 	bool top_zero,			// if top halo should be zeroed
         at::Tensor top_out_halo,        // top output halo buffer (in local device memory, received from top neighbor)
 	at::Tensor top_inp_transfer,    // top input transfer buffer (in local peer memory)

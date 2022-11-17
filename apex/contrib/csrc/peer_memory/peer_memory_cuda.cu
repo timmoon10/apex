@@ -147,85 +147,114 @@ inline __device__ void push_pull_tensor(
         const int num_threads
 	)
 {
-    // communicate in 128b chunks
-    // Note: NVLink flit size is 128b=16B. Use last 4B as a semaphore.
+    // 128b=16B NVLink flit
+    // Note: Use last 4B as a semaphore
     static_assert(sizeof(T) <= 12);
     union Flit {
         T payload;
         uint uints[4];
     };
+    // Communication bit indicates whether flit has been received from
+    // a remote GPU
+    constexpr uint communication_mask = 1 << 0;
+    // Status bit is used to choose the active peer buffer in an
+    // alternating double buffer scheme. We use buffer 1 if the bits
+    // match, use buffer 2 if the bits differ, and invert the bit
+    // after finishing with a buffer.
+    constexpr uint status_mask = 1 << 1;
 
+    // Split peer memory into two sets of buffers
+    volatile int* local_peer1 = reinterpret_cast<volatile int*>(local_peer + 2*thread_id);
+    volatile int* local_peer2 = reinterpret_cast<volatile int*>(local_peer + 2*thread_id + 1);
+    volatile int* remote_peer1 = reinterpret_cast<volatile int*>(remote_peer + 2*thread_id);
+    volatile int* remote_peer2 = reinterpret_cast<volatile int*>(remote_peer + 2*thread_id + 1);
+
+    // Iterate through tensor entries
     const int count = NC*NH*NW;
     for (int i = thread_id; i < count; i += num_threads) {
-        // calculate buffer positions
+        // Calculate buffer positions
         int c, h, w;
         if (channels_last) {
-            const int j = i / NC;
             c = i % NC;
-            h = j / NW;
+            const int j = i / NC;
             w = j % NW;
+            h = j / NW;
         } else {
-            const int j = i / NW;
             w = i % NW;
-            c = j / NH;
+            const int j = i / NW;
             h = j % NH;
+            c = j / NH;
         }
 
-        // buffer entries
-        const T& ih = data_in[c*data_in_stride_C + h*data_in_stride_H + w*data_in_stride_W];
-        volatile int* ox_ptr = reinterpret_cast<volatile int*>(remote_peer + thread_id);
-        volatile int* ix_ptr = reinterpret_cast<volatile int*>(local_peer + thread_id);
-        T& oh = data_out[c*data_out_stride_C + h*data_out_stride_H + w*data_out_stride_W];
-
         if (zero) {
-	    __zero(&oh);
+            T* oh = data_out + c*data_out_stride_C + h*data_out_stride_H + w*data_out_stride_W;
+	    __zero(oh);
         } else {
-            // pack value into flit
-            Flit ox;
-            ox.payload = ih;
-            ox.uints[3] = 0xffffffff;
+            // Data buffer entries
+            const T* ih = data_in + c*data_in_stride_C + h*data_in_stride_H + w*data_in_stride_W;
+            T* oh = data_out + c*data_out_stride_C + h*data_out_stride_H + w*data_out_stride_W;
 
-            // make sure peer buffer is ready
-            // TODO consider double-buffering for push-only communication
-            Flit is_not_ready;
-            do {
-                asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" :
-                             "=r"(is_not_ready.uints[0]),
-                             "=r"(is_not_ready.uints[1]),
-                             "=r"(is_not_ready.uints[2]),
-                             "=r"(is_not_ready.uints[3])
-                             : "l"(ox_ptr) : "memory");
-            } while (is_not_ready.uints[3] != 0);
+            // Determine which peer memory buffer to use
+            // Note: The status bit is not affected by asynchronous
+            // communication from the remote GPU.
+            Flit local_message1, local_message2;
+            asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" :
+                         "=r"(local_message1.uints[0]),
+                         "=r"(local_message1.uints[1]),
+                         "=r"(local_message1.uints[2]),
+                         "=r"(local_message1.uints[3])
+                         : "l"(local_peer1) : "memory");
+            asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" :
+                         "=r"(local_message2.uints[0]),
+                         "=r"(local_message2.uints[1]),
+                         "=r"(local_message2.uints[2]),
+                         "=r"(local_message2.uints[3])
+                         : "l"(local_peer2) : "memory");
+            const uint status1 = local_message1.uints[3] & status_mask;
+            const uint status2 = local_message2.uints[3] & status_mask;
+            const bool peer1_is_active = (status1 ^ status2) == 0;
+            volatile int* ox = peer1_is_active ? remote_peer1 : remote_peer2;
+            volatile int* ix = peer1_is_active ? local_peer1 : local_peer2;
+            const uint status = peer1_is_active ? status1 : status2;
+            Flit recv_message = peer1_is_active ? local_message1 : local_message2;
 
-            // send flit to peer
+            // Send flit to remote GPU
+            // Note: Set communication bit and keep status bit
+            Flit send_message;
+            send_message.payload = *ih;
+            send_message.uints[3] = communication_mask | status;
             asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::
-                         "l"(ox_ptr),
-                         "r"(ox.uints[0]),
-                         "r"(ox.uints[1]),
-                         "r"(ox.uints[2]),
-                         "r"(ox.uints[3])
+                         "l"(ox),
+                         "r"(send_message.uints[0]),
+                         "r"(send_message.uints[1]),
+                         "r"(send_message.uints[2]),
+                         "r"(send_message.uints[3])
                          : "memory");
 
-            // wait to recieve flit from peer
-            Flit ix;
-            do {
+            // Recieve flit from peer
+            while ((recv_message.uints[3] & communication_mask) == 0) {
                 asm volatile("ld.volatile.global.v4.u32 {%0,%1,%2,%3}, [%4];" :
-                             "=r"(ix.uints[0]),
-                             "=r"(ix.uints[1]),
-                             "=r"(ix.uints[2]),
-                             "=r"(ix.uints[3])
-                             : "l"(ix_ptr) : "memory");
-            } while (ix.uints[3] == 0);
-            asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::
-                         "l"(ix_ptr),
-                         "n"(0),
-                         "n"(0),
-                         "n"(0),
-                         "n"(0)
-                         : "memory");
+                             "=r"(recv_message.uints[0]),
+                             "=r"(recv_message.uints[1]),
+                             "=r"(recv_message.uints[2]),
+                             "=r"(recv_message.uints[3])
+                             : "l"(ix) : "memory");
+            }
+            *oh = recv_message.payload;
 
-            // unpack value from flit
-            oh = ix.payload;
+            // Reset semaphore
+            // Note: Clear communication bit and invert status bit
+            uint flag = ~status & status_mask;
+            asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::
+                         "l"(ix),
+                         "n"(0),
+                         "n"(0),
+                         "n"(0),
+                         "r"(flag)
+                         : "memory");
+            if (i + num_threads < count) {
+                __threadfence_system();
+            }
         }
     }
 }
@@ -246,13 +275,17 @@ __global__ void push_pull_halos_1d_kernel(
         int4* box,                                                              // btm output transfer buffer (remote peer)
         int4* bix,                                                              // btm input transfer buffer (local peer)
         // dimensions
-        int NC, int NH, int NW
+        int NC, int NH, int NW,
+        bool top_first                                                          // whether to launch communicate top halo first
         )
 {
     const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
     const int num_threads_per_side = (gridDim.x / 2) * blockDim.x;
-    const bool in_top_block = thread_id < num_threads_per_side;
-    const int side_thread_id = in_top_block ? thread_id : thread_id - num_threads_per_side;
+    const bool in_top_block = (top_first
+                               ? thread_id < num_threads_per_side
+                               : thread_id >= num_threads_per_side);
+    const int side_thread_id = thread_id % num_threads_per_side;
+
     if (in_top_block) {
         push_pull_tensor<T,channels_last,top_zero>(
             tih, tih_stride_C, tih_stride_H, tih_stride_W,
@@ -356,6 +389,7 @@ void push_pull_halos_1d(
 	bool diagnostics,
         bool explicit_nhwc,
         int numSM,                      // number of SMs to use (zero corresponds to all SMs)
+        int peer_rank,                  // rank in spatial parallel group
 	bool top_zero,			// if top halo should be zeroed
         at::Tensor top_in_halo,         // top input halo buffer (in local device memory, sent to top neighbor)
 	at::Tensor top_in_transfer,	// top input transfer buffer (in local peer memory)
@@ -410,6 +444,9 @@ void push_pull_halos_1d(
     bool is_nhwc = (toh_stride_C == 1);
     if (diagnostics) printf("is_nhwc = %s\n",is_nhwc?"true":"false");
 
+    // determine whether to communicate top halo first
+    bool top_first = peer_rank % 2 != 0;
+
     // peer memory buffers
     int tox_size = top_out_transfer.numel() * top_out_transfer.element_size();
     int tix_size = top_in_transfer.numel() * top_in_transfer.element_size();
@@ -457,15 +494,15 @@ void push_pull_halos_1d(
             grid.x = 2 * ((NUM_ELEMENTS + block.x - 1) / block.x);      \
         }                                                               \
         if (!TOP_ZERO) {                                                \
-            /* require 128b=16B peer memory per thread */               \
-            if ((grid.x / 2) * block.x * 16 > tox_size) {               \
-                grid.x = 2 * (tox_size / (block.x * 16));               \
+            /* require 2*128b=32B peer memory per thread */             \
+            if ((grid.x / 2) * block.x * 32 > tox_size) {               \
+                grid.x = 2 * (tox_size / (block.x * 32));               \
             }                                                           \
         }                                                               \
         if (!BTM_ZERO) {                                                \
-            /* require 128b=16B peer memory per thread */               \
-            if ((grid.x / 2) * block.x * 16 > box_size) {               \
-                grid.x = 2 * (box_size / (block.x * 16));               \
+            /* require 2*128b=32B peer memory per thread */             \
+            if ((grid.x / 2) * block.x * 32 > box_size) {               \
+                grid.x = 2 * (box_size / (block.x * 32));               \
             }                                                           \
         }                                                               \
         TORCH_CHECK(grid.x >= 2);                                       \
@@ -530,7 +567,8 @@ void push_pull_halos_1d(
                 (int2**)&boh_p, &boh_stride_C, &boh_stride_H, &boh_stride_W,
                 (int2**)&bih_p, &bih_stride_C, &bih_stride_H, &bih_stride_W,
                 &box_p, &bix_p,
-                &NC, &NH, &NW
+                &NC, &NH, &NW,
+                &top_first
             };
             int num_elem = NC*NH*NW;
             LAUNCH_PUSH_PULL_HALO_KERNEL(int2, true, kernel_args, num_elem);
@@ -544,7 +582,8 @@ void push_pull_halos_1d(
                 &boh_p, &boh_stride_C, &boh_stride_H, &boh_stride_W,
                 &bih_p, &bih_stride_C, &bih_stride_H, &bih_stride_W,
                 &box_p, &bix_p,
-                &NC, &NH, &NW
+                &NC, &NH, &NW,
+                &top_first
             };
             int num_elem = NC*NH*NW;
             if (is_nhwc) {
