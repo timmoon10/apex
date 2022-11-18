@@ -128,6 +128,11 @@ inline __device__ void __zero(int2* dst)
     *dst = {0, 0};
 }
 
+inline __device__ void __zero(int4* dst)
+{
+    *dst = {0, 0, 0, 0};
+}
+
 template<class T, bool channels_last, bool zero>
 inline __device__ void push_pull_tensor(
         const T* __restrict__ data_in,
@@ -150,7 +155,7 @@ inline __device__ void push_pull_tensor(
 {
     // 128b=16B NVLink flit
     // Note: Use last 4B as a semaphore
-    static_assert(sizeof(T) <= 12);
+    static_assert(sizeof(T) <= 16);
     union Flit {
         T payload;
         uint uints[4];
@@ -162,7 +167,7 @@ inline __device__ void push_pull_tensor(
     // alternating double buffer scheme. We use buffer 1 if the bits
     // match, use buffer 2 if the bits differ, and invert the bit
     // after finishing with a buffer.
-    constexpr uint status_mask = 1 << 1;
+    constexpr uint status_mask = 1 << 0;
 
     // Split peer memory into two sets of buffers
 
@@ -179,7 +184,12 @@ inline __device__ void push_pull_tensor(
     const int global_id = thread_id + block_id * THREADS_PER_CTA;
     const int num_threads = num_blocks * THREADS_PER_CTA;
     const int count = NC*NH*NW;
-    for (int i = global_id; i < count; i += num_threads) {
+    for (int offset = block_id * THREADS_PER_CTA;
+         offset < count;
+         offset += num_threads) {
+        const int i = offset + thread_id;
+        const bool has_data = i < count;
+
         // Calculate buffer positions
         int c, h, w;
         if (channels_last) {
@@ -195,13 +205,11 @@ inline __device__ void push_pull_tensor(
         }
 
         if (zero) {
-            T* oh = data_out + c*data_out_stride_C + h*data_out_stride_H + w*data_out_stride_W;
-	    __zero(oh);
+            if (has_data) {
+               T* oh = data_out + c*data_out_stride_C + h*data_out_stride_H + w*data_out_stride_W;
+                __zero(oh);
+            }
         } else {
-            // Data buffer entries
-            const T* ih = data_in + c*data_in_stride_C + h*data_in_stride_H + w*data_in_stride_W;
-            T* oh = data_out + c*data_out_stride_C + h*data_out_stride_H + w*data_out_stride_W;
-
             // Determine which peer memory buffer to use
             // Note: The status bit is not affected by asynchronous
             // communication from the remote GPU.
@@ -218,8 +226,8 @@ inline __device__ void push_pull_tensor(
                          "=r"(local_message2.uints[2]),
                          "=r"(local_message2.uints[3])
                          : "l"(local_peer2) : "memory");
-            const uint status1 = local_message1.uints[3] & status_mask;
-            const uint status2 = local_message2.uints[3] & status_mask;
+            const uint status1 = local_message1.uints[2] & status_mask;
+            const uint status2 = local_message2.uints[2] & status_mask;
             const bool peer1_is_active = (status1 ^ status2) == 0;
             volatile int* ox = peer1_is_active ? remote_peer1 : remote_peer2;
             volatile int* ix = peer1_is_active ? local_peer1 : local_peer2;
@@ -229,8 +237,12 @@ inline __device__ void push_pull_tensor(
             // Send flit to remote GPU
             // Note: Set communication bit and keep status bit
             Flit send_message;
-            send_message.payload = *ih;
-            send_message.uints[3] = communication_mask | status;
+            if (has_data) {
+                const T* ih = data_in + c*data_in_stride_C + h*data_in_stride_H + w*data_in_stride_W;
+                send_message.payload = *ih;
+            }
+            send_message.uints[2] = (send_message.uints[2] & ~status_mask) | status;
+            send_message.uints[3] = send_message.uints[3] | communication_mask;
             asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::
                          "l"(ox),
                          "r"(send_message.uints[0]),
@@ -248,19 +260,22 @@ inline __device__ void push_pull_tensor(
                              "=r"(recv_message.uints[3])
                              : "l"(ix) : "memory");
             }
-            *oh = recv_message.payload;
+            if (has_data) {
+                T* oh = data_out + c*data_out_stride_C + h*data_out_stride_H + w*data_out_stride_W;
+                *oh = recv_message.payload;
+            }
 
             // Reset semaphore
             // Note: Clear communication bit and invert status bit
-            uint flag = ~status & status_mask;
+            uint flag = ~status;
             asm volatile("st.volatile.global.v4.u32 [%0], {%1,%2,%3,%4};" ::
                          "l"(ix),
                          "n"(0),
                          "n"(0),
-                         "n"(0),
-                         "r"(flag)
+                         "r"(flag),
+                         "n"(0)
                          : "memory");
-            if (i + num_threads < count) {
+            if (offset + num_threads < count) {
                 __threadfence_system();
             }
         }
@@ -394,6 +409,7 @@ at::Tensor blob_view_int(int64_t raw, std::vector<int64_t> shape, bool channels_
 void push_pull_halos_1d(
 	bool diagnostics,
         bool explicit_nhwc,
+        bool exact_copy,                // whether halo exchange will be bit-wise accurate
         int numSM,                      // number of SMs to use (zero corresponds to all SMs)
         int peer_rank,                  // rank in spatial parallel group
 	bool top_zero,			// if top halo should be zeroed
@@ -545,11 +561,44 @@ void push_pull_halos_1d(
         int4* bix_p = reinterpret_cast<int4*>(btm_in_transfer.data_ptr<scalar_t>());
         if (diagnostics) printf("waypoint1\n");
 
-        // do int2 vector loads if channel count permits
+        // do int4 or int2 vector loads if channel count permits
         int elem_size_in_bytes = toh_C * sizeof(scalar_t);
         int elem_size_in_int2 = (elem_size_in_bytes / 8);
-        if (diagnostics) printf("elem_size_in_bytes = %d, elem_size_in_int2 = %d\n",elem_size_in_bytes,elem_size_in_int2);
-        if (is_nhwc && elem_size_in_int2*8 == elem_size_in_bytes) {
+        int elem_size_in_int4 = (elem_size_in_bytes / 16);
+        if (diagnostics) {
+            printf("elem_size_in_bytes = %d, elem_size_in_int2 = %d, elem_size_in_int4 = %d\n",
+                   elem_size_in_bytes, elem_size_in_int2, elem_size_in_int4);
+        }
+        if (!exact_copy && is_nhwc && elem_size_in_int4*16 == elem_size_in_bytes) {
+            // can do int4 transfers
+            int divisor = 16 / sizeof(scalar_t);
+            if (diagnostics) printf("CAN DO INT4 :: divisor = %d\n",divisor);
+            toh_stride_N /= divisor;   toh_stride_H /= divisor;    toh_stride_W /= divisor;
+            tih_stride_N /= divisor;   tih_stride_H /= divisor;    tih_stride_W /= divisor;
+            boh_stride_N /= divisor;   boh_stride_H /= divisor;    boh_stride_W /= divisor;
+            bih_stride_N /= divisor;   bih_stride_H /= divisor;    bih_stride_W /= divisor;
+            NC /= divisor;
+            if (diagnostics) {
+                printf("divisor=%d\n",divisor);
+                printf("tih_stride :: N=%d, C=%d, H=%d, W=%d\n",tih_stride_N,tih_stride_C,tih_stride_H,tih_stride_W);
+                printf("toh_stride :: N=%d, C=%d, H=%d, W=%d\n",toh_stride_N,toh_stride_C,toh_stride_H,toh_stride_W);
+                printf("bih_stride :: N=%d, C=%d, H=%d, W=%d\n",bih_stride_N,bih_stride_C,bih_stride_H,bih_stride_W);
+                printf("boh_stride :: N=%d, C=%d, H=%d, W=%d\n",boh_stride_N,boh_stride_C,boh_stride_H,boh_stride_W);
+                printf("NC=%d, NH=%d, NW=%d\n",NC,NH,NW);
+            }
+            void *kernel_args[] = {
+                (int4**)&toh_p, &toh_stride_C, &toh_stride_H, &toh_stride_W,
+                (int4**)&tih_p, &tih_stride_C, &tih_stride_H, &tih_stride_W,
+                &tox_p, &tix_p,
+                (int4**)&boh_p, &boh_stride_C, &boh_stride_H, &boh_stride_W,
+                (int4**)&bih_p, &bih_stride_C, &bih_stride_H, &bih_stride_W,
+                &box_p, &bix_p,
+                &NC, &NH, &NW,
+                &top_first
+            };
+            int num_elem = NC*NH*NW;
+            LAUNCH_PUSH_PULL_HALO_KERNEL(int4, true, kernel_args, num_elem);
+        } else if (is_nhwc && elem_size_in_int2*8 == elem_size_in_bytes) {
             // can do int2 transfers
             int divisor = 8 / sizeof(scalar_t);
             if (diagnostics) printf("CAN DO INT2 :: divisor = %d\n",divisor);
@@ -580,7 +629,7 @@ void push_pull_halos_1d(
             LAUNCH_PUSH_PULL_HALO_KERNEL(int2, true, kernel_args, num_elem);
         } else {
             // cannot do int2 transfers
-            if (diagnostics) printf("CAN NOT DO INT2\n");
+            if (diagnostics) printf("CAN NOT DO INT4 or INT2\n");
             void *kernel_args[] = {
                 &toh_p, &toh_stride_C, &toh_stride_H, &toh_stride_W,
 		&tih_p, &tih_stride_C, &tih_stride_H, &tih_stride_W,

@@ -31,6 +31,7 @@ namespace apex { namespace contrib { namespace peer_memory {
     void push_pull_halos_1d(
         bool diagnostics,
         bool explicit_nhwc,
+        bool exact_copy,                // whether halo exchange will be bit-wise accurate
         int numSM,                      // number of SMs to use
         int peer_rank,                  // rank in spatial parallel group
 	bool top_zero,			// if top halo should be zeroed

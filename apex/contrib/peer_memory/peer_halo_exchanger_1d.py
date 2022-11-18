@@ -15,11 +15,18 @@ class PeerHaloExchanger1d:
         self.peer_pool = peer_pool
         self.half_halo = half_halo
 
-    def _allocate_peer_tensor(self, halo):
+    def _allocate_peer_tensor(self, halo, exact_copy=True):
 
         # Compute size in bytes
+        # Note: Halo exchange kernel uses double-buffering scheme to
+        # enable push-only communication. If bit-wise accuracy is
+        # required, 2x memory is required since half is required to
+        # store semaphores.
         # Note: Pad buffer so each CUDA block gets required buffer size
-        size = 4 * halo.numel() * halo.element_size()
+        if exact_copy:
+            size = 4 * halo.numel() * halo.element_size()
+        else:
+            size = 2 * halo.numel() * halo.element_size()
         size_per_block = 128 * 2 * 16   # 128 threads each require two 128b buffers
         size = (size + size_per_block - 1) // size_per_block * size_per_block
 
@@ -27,48 +34,48 @@ class PeerHaloExchanger1d:
         shape = [1, 1, 1, size // halo.element_size()]
         return self.peer_pool.allocate_peer_tensors(shape, halo.dtype, False, True)
 
-    def __call__(self, y, H_split=True, explicit_nhwc=False, numSM=1, diagnostics=False):
+    def __call__(self, y, H_split=True, explicit_nhwc=False, exact_copy=True, numSM=1, diagnostics=False):
         channels_last = y.is_contiguous(memory_format=torch.channels_last) and not explicit_nhwc
         if H_split:
             if explicit_nhwc:
                 _, Hs, _, _ = list(y.shape)
                 H = Hs - 2*self.half_halo
                 low_out_halo = y[:,self.half_halo:2*self.half_halo,:,:]
-                low_tx = self._allocate_peer_tensor(low_out_halo)
+                low_tx = self._allocate_peer_tensor(low_out_halo, exact_copy=exact_copy)
                 low_inp_halo = y[:,:self.half_halo,:,:]
                 high_out_halo = y[:,H:H+self.half_halo,:,:]
-                high_tx = self._allocate_peer_tensor(high_out_halo)
+                high_tx = self._allocate_peer_tensor(high_out_halo, exact_copy=exact_copy)
                 high_inp_halo = y[:,H+self.half_halo:H+2*self.half_halo,:,:]
             else:
                 _, _, Hs, _ = list(y.shape)
                 H = Hs - 2*self.half_halo
                 low_out_halo = y[:,:,self.half_halo:2*self.half_halo,:]
-                low_tx = self._allocate_peer_tensor(low_out_halo)
+                low_tx = self._allocate_peer_tensor(low_out_halo, exact_copy=exact_copy)
                 low_inp_halo = y[:,:,:self.half_halo,:]
                 high_out_halo = y[:,:,H:H+self.half_halo,:]
-                high_tx = self._allocate_peer_tensor(high_out_halo)
+                high_tx = self._allocate_peer_tensor(high_out_halo, exact_copy=exact_copy)
                 high_inp_halo = y[:,:,H+self.half_halo:H+2*self.half_halo,:]
         else:
             if explicit_nhwc:
                 _, _, Ws, _ = list(y.shape)
                 W = Ws - 2*self.half_halo
                 low_out_halo = y[:,:,self.half_halo:2*self.half_halo,:]
-                low_tx = self._allocate_peer_tensor(low_out_halo)
+                low_tx = self._allocate_peer_tensor(low_out_halo, exact_copy=exact_copy)
                 low_inp_halo = y[:,:,:self.half_halo,:]
                 high_out_halo = y[:,:,W:W+self.half_halo,:]
-                high_tx = self._allocate_peer_tensor(high_out_halo)
+                high_tx = self._allocate_peer_tensor(high_out_halo, exact_copy=exact_copy)
                 high_inp_halo = y[:,:,W+self.half_halo:W+2*self.half_halo,:]
             else:
                 _, _, _, Ws = list(y.shape)
                 W = Ws - 2*self.half_halo
                 low_out_halo = y[:,:,:,self.half_halo:2*self.half_halo]
-                low_tx = self._allocate_peer_tensor(low_out_halo)
+                low_tx = self._allocate_peer_tensor(low_out_halo, exact_copy=exact_copy)
                 low_inp_halo = y[:,:,:,:self.half_halo]
                 high_out_halo = y[:,:,:,W:W+self.half_halo]
-                high_tx = self._allocate_peer_tensor(high_out_halo)
+                high_tx = self._allocate_peer_tensor(high_out_halo, exact_copy=exact_copy)
                 high_inp_halo = y[:,:,:,W+self.half_halo:W+2*self.half_halo]
         pm.push_pull_halos_1d(
-                diagnostics, explicit_nhwc, numSM, self.peer_rank,
+                diagnostics, explicit_nhwc, exact_copy, numSM, self.peer_rank,
                 self.low_zero, low_out_halo, low_tx[self.peer_rank], high_tx[self.low_neighbor], low_inp_halo,
                 self.high_zero, high_out_halo, high_tx[self.peer_rank], low_tx[self.high_neighbor], high_inp_halo,
                 )
