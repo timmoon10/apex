@@ -144,7 +144,8 @@ inline __device__ void push_pull_tensor(
         const int NH,
         const int NW,
         const int thread_id,
-        const int num_threads
+        const int block_id,
+        const int num_blocks
 	)
 {
     // 128b=16B NVLink flit
@@ -164,14 +165,21 @@ inline __device__ void push_pull_tensor(
     constexpr uint status_mask = 1 << 1;
 
     // Split peer memory into two sets of buffers
-    volatile int* local_peer1 = reinterpret_cast<volatile int*>(local_peer + 2*thread_id);
-    volatile int* local_peer2 = reinterpret_cast<volatile int*>(local_peer + 2*thread_id + 1);
-    volatile int* remote_peer1 = reinterpret_cast<volatile int*>(remote_peer + 2*thread_id);
-    volatile int* remote_peer2 = reinterpret_cast<volatile int*>(remote_peer + 2*thread_id + 1);
+
+    // Note: Each block owns a THREADS_PER_CTA*2*16B chunk of peer
+    // memory. This chunk
+    const int peer_offset1 = block_id * THREADS_PER_CTA * 2 + thread_id;
+    const int peer_offset2 = peer_offset1 + THREADS_PER_CTA;
+    volatile int* local_peer1 = reinterpret_cast<volatile int*>(local_peer + peer_offset1);
+    volatile int* local_peer2 = reinterpret_cast<volatile int*>(local_peer + peer_offset2);
+    volatile int* remote_peer1 = reinterpret_cast<volatile int*>(remote_peer + peer_offset1);
+    volatile int* remote_peer2 = reinterpret_cast<volatile int*>(remote_peer + peer_offset2);
 
     // Iterate through tensor entries
+    const int global_id = thread_id + block_id * THREADS_PER_CTA;
+    const int num_threads = num_blocks * THREADS_PER_CTA;
     const int count = NC*NH*NW;
-    for (int i = thread_id; i < count; i += num_threads) {
+    for (int i = global_id; i < count; i += num_threads) {
         // Calculate buffer positions
         int c, h, w;
         if (channels_last) {
@@ -279,27 +287,25 @@ __global__ void push_pull_halos_1d_kernel(
         bool top_first                                                          // whether to launch communicate top halo first
         )
 {
-    const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
-    const int num_threads_per_side = (gridDim.x / 2) * blockDim.x;
-    const bool in_top_block = (top_first
-                               ? thread_id < num_threads_per_side
-                               : thread_id >= num_threads_per_side);
-    const int side_thread_id = thread_id % num_threads_per_side;
-
+    const int num_blocks_side = gridDim.x / 2;
+    const int block_id_side = (blockIdx.x < num_blocks_side
+                               ? blockIdx.x
+                               : blockIdx.x - num_blocks_side);
+    const bool in_top_block = top_first == (blockIdx.x < num_blocks_side);
     if (in_top_block) {
         push_pull_tensor<T,channels_last,top_zero>(
             tih, tih_stride_C, tih_stride_H, tih_stride_W,
             toh, toh_stride_C, toh_stride_H, toh_stride_W,
             tix, tox,
             NC, NH, NW,
-            side_thread_id, num_threads_per_side);
+            threadIdx.x, block_id_side, num_blocks_side);
     } else {
         push_pull_tensor<T,channels_last,btm_zero>(
             bih, bih_stride_C, bih_stride_H, bih_stride_W,
             boh, boh_stride_C, boh_stride_H, boh_stride_W,
             bix, box,
             NC, NH, NW,
-            side_thread_id, num_threads_per_side);
+            threadIdx.x, block_id_side, num_blocks_side);
     }
 }
 
@@ -489,20 +495,20 @@ void push_pull_halos_1d(
             /* require even number of blocks (half for top, half for bottom) */ \
             grid.x -= 1;                                                \
         }                                                               \
-        if ((grid.x / 2) * block.x > NUM_ELEMENTS) {                    \
+        if ((grid.x / 2) * THREADS_PER_CTA > NUM_ELEMENTS) {            \
             /* only need enough blocks to cover top and bottom halo elements */ \
-            grid.x = 2 * ((NUM_ELEMENTS + block.x - 1) / block.x);      \
+            grid.x = 2 * ((NUM_ELEMENTS + THREADS_PER_CTA - 1) / THREADS_PER_CTA); \
         }                                                               \
         if (!TOP_ZERO) {                                                \
             /* require 2*128b=32B peer memory per thread */             \
-            if ((grid.x / 2) * block.x * 32 > tox_size) {               \
-                grid.x = 2 * (tox_size / (block.x * 32));               \
+            if ((grid.x / 2) * THREADS_PER_CTA * 32 > tox_size) {       \
+                grid.x = 2 * (tox_size / (THREADS_PER_CTA * 32));       \
             }                                                           \
         }                                                               \
         if (!BTM_ZERO) {                                                \
             /* require 2*128b=32B peer memory per thread */             \
-            if ((grid.x / 2) * block.x * 32 > box_size) {               \
-                grid.x = 2 * (box_size / (block.x * 32));               \
+            if ((grid.x / 2) * THREADS_PER_CTA * 32 > box_size) {       \
+                grid.x = 2 * (box_size / (THREADS_PER_CTA * 32));       \
             }                                                           \
         }                                                               \
         TORCH_CHECK(grid.x >= 2);                                       \
