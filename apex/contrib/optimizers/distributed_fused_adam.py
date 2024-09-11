@@ -3346,11 +3346,18 @@ class DistributedFusedAdam(torch.optim.Optimizer):
 
             # All-gather shards
             main_stream.wait_stream(stream)
-            all_gather_into_tensor(
-                bucket_buffer,
-                shard,
-                group=self.distributed_process_group,
-            )
+            group = self.distributed_process_group
+            with _coalescing_manager(group, self.device, async_ops=True) as cm:
+                _coalescing_manager_append_work(
+                    cm,
+                    all_gather_into_tensor(
+                        bucket_buffer,
+                        shard,
+                        group=group,
+                        async_op=True,
+                    ),
+                )
+            cm.wait()
             stream.wait_stream(main_stream)
 
         def finish_all_gather(bucket_id: int, state_dict_key: str) -> None:
